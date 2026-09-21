@@ -1,0 +1,532 @@
+#pragma once
+
+#include <stdio.h>
+#include <string.h>
+#include <functional>
+#include "keyboard.h"
+#include "8253.h"
+#include "ay.h"
+#include "fd1793.h"
+#include "wav.h"
+
+#include "serialize.h"
+#include "sound_events.h"
+
+class IO {
+private:
+    uint32_t palette[16];
+    /* Raw palette byte (Vector-06C hardware color 0..255) behind each
+     * expanded entry: the PSP port stores these into the frame so the
+     * GE expands them through a static CLUT (see TV::clut). */
+    uint8_t palette_raw[16];
+
+    /* Precomputed hardware-color -> framebuffer-pixel table. The Vector
+     * color is an 8-bit value (bits 0-7), so 256 entries cover the whole
+     * range; the table is sized 512 and the upper half is a duplicate so
+     * commit_palette() can index it mask-safe with (w8 & 0x1ff). Built
+     * once in Board::init() from the very same rgb2pixelformat() the hot
+     * path used to invoke through a std::function, so the lookup is
+     * bit-for-bit identical while removing the indirect call. */
+    uint32_t pix_lut[512];
+
+    Memory & kvaz;
+    Keyboard & keyboard;
+    I8253 & timer;
+    FD1793 & fdc;
+    AY & ay;
+    WavPlayer & tape_player;
+
+    uint8_t CW, PA, PB, PC, PIA1_last;
+    uint8_t CW2, PA2, PB2, PC2;
+
+    uint8_t joy_0e, joy_0f;
+
+    /* Bit 3 of PC is the РУС/ЛАТ lamp once the ROM takes over.
+     * The boot-time PIA init resets PC to 0, which would look like a
+     * 1->0 lamp edge; deliver onruslat only after the ROM itself has
+     * first moved the bit. */
+    bool ruslat_armed;
+
+    int outport;
+    int outbyte;
+    int palettebyte;
+public:
+    std::function<void(int)> onborderchange;
+    std::function<void(bool)> onmodechange;
+    std::function<void(bool)> onruslat;
+    std::function<uint32_t(uint8_t,uint8_t,uint8_t)> rgb2pixelformat;
+
+    std::function<int(uint32_t,uint8_t)> onread;
+    std::function<void(uint32_t,uint8_t)> onwrite;
+
+    /* Sound event sink: timestamped writes to the sound chips, rendered
+     * in batch by Soundnik at the end of frame (see sound_events.h). */
+    std::function<void(SoundEventType,uint8_t,uint8_t)> sound_event;
+
+public:
+    IO(Memory & _memory, Keyboard & _keyboard, I8253 & _timer, FD1793 & _fdc, 
+            AY & _ay, WavPlayer & _tape_player) 
+        : kvaz(_memory), keyboard(_keyboard), timer(_timer), fdc(_fdc), ay(_ay),
+        tape_player(_tape_player),
+        CW(0x08), PA(0xff), PB(0xff), PC(0xff), CW2(0), PA2(0xff), PB2(0xff), PC2(0xff)
+    {
+        for (unsigned i = 0; i < sizeof(palette)/sizeof(palette[0]); ++i) {
+            palette[i] = 0xff000000;
+            palette_raw[i] = 0x00;
+        }
+        outport = outbyte = palettebyte = -1;
+        joy_0e = joy_0f = 0xff;
+        ruslat_armed = false;
+    }
+
+    /* Fill pix_lut[] using the existing rgb2pixelformat() conversion with
+     * the identical bit extraction commit_palette() applies, so that
+     * pix_lut[w8 & 0x1ff] equals the old rgb2pixelformat(r, g, b) result
+     * for every hardware color byte. Called once from Board::init() right
+     * after rgb2pixelformat is bound; never in the hot path. */
+    void build_pix_lut()
+    {
+        for (int i = 0; i < 512; ++i) {
+            const int r = (i & 0x07);
+            const int g = (i & 0x38) >> 3;
+            const int b = (i & 0xc0) >> 6;
+            this->pix_lut[i] = this->rgb2pixelformat(r, g, b);
+        }
+    }
+
+    void yellowblue()
+    {
+        // Create boot-time yellow/blue yeblette using correct pixelformat
+        for (int i = 0; i < 16; ++i) {
+            if (i & 2) {
+                this->palette[i] = rgb2pixelformat(5, 5, 0); 
+                this->palette_raw[i] = 5 | (5 << 3);
+            } 
+            else {
+                this->palette[i] = rgb2pixelformat(0, 0, 2); 
+                this->palette_raw[i] = 2 << 6;
+            }
+        }
+    }
+
+    /* Back to the power-on state, the same sequence main.cpp runs at
+     * startup (constructor defaults + yellowblue()). Used by
+     * Board::reset(LOADROM) so the palette and PIA registers of the
+     * previously loaded ROM do not leak into the next one: programs
+     * that never set their own palette rely on the boot loader's. */
+    void reset()
+    {
+        CW = 0x08; PA = 0xff; PB = 0xff; PC = 0xff;
+        PIA1_last = 0xff; /* constructor leaves it indeterminate */
+        CW2 = 0; PA2 = 0xff; PB2 = 0xff; PC2 = 0xff;
+        for (unsigned i = 0; i < sizeof(palette)/sizeof(palette[0]); ++i) {
+            palette[i] = 0xff000000;
+            palette_raw[i] = 0x00;
+        }
+        outport = outbyte = palettebyte = -1;
+        joy_0e = joy_0f = 0xff;
+        ruslat_armed = false;
+        yellowblue();
+    }
+
+    int input(int port)
+    {
+        int result = 0xff;
+        
+        switch(port) {
+            case 0x00:
+                result = 0xff;
+                break;
+            case 0x01:
+                {
+                /* PC.low input ? */
+                auto pclow = (this->CW & 0x01) ? 0x0b : (this->PC & 0x0f);
+                /* PC.high input ? */
+                auto pcupp = (this->CW & 0x08) ? 
+                    ((this->tape_player.sample() << 4) |
+                     (this->keyboard.ss ? 0 : (1 << 5)) |
+                     (this->keyboard.us ? 0 : (1 << 6)) |
+                     (this->keyboard.rus ? 0 : (1 << 7))) : (this->PC & 0xf0);
+                result = pclow | pcupp;
+                }
+                break;
+            case 0x02:
+                if ((this->CW & 0x02) != 0) {
+                    result = this->keyboard.read(~this->PA); // input
+                } else {
+                    result = this->PB;       // output
+                }
+                break;
+            case 0x03:
+                if ((this->CW & 0x10) == 0) { 
+                    result = this->PA;       // output
+                } else {
+                    result = 0xff;          // input
+                }
+                break;
+
+            case 0x04:
+                result = this->CW2;
+                break;
+            case 0x05:
+                result = this->PC2;
+                break;
+            case 0x06:
+                result = this->PB2;
+                break;
+            case 0x07:
+                result = this->PA2;
+                break;
+
+                // Timer
+            case 0x08:
+            case 0x09:
+            case 0x0a:
+            case 0x0b:
+                return this->timer.read(~(port & 3));
+
+                // Joystick "C"
+            case 0x0e:
+                return this->joy_0e;
+            case 0x0f:
+                return this->joy_0f;
+
+            case 0x14:
+            case 0x15:
+                result = this->ay.read(port & 1);
+                break;
+
+            case 0x18: // fdc data
+                result = this->fdc.read(3);
+                break;
+            case 0x19: // fdc sector
+                result = this->fdc.read(2);
+                break;
+            case 0x1a: // fdc track
+                result = this->fdc.read(1);
+                break;
+            case 0x1b: // fdc status
+                result = this->fdc.read(0);
+                break;
+            case 0x1c: // fdc control - readonly
+                //result = this->fdc.read(4);
+                break;
+            default:
+                break;
+        }
+
+        if (this->onread) {
+            int hookresult = this->onread((uint32_t)port, (uint8_t)result);
+            if (hookresult != -1) {
+                result = hookresult;
+            }
+        }
+
+        return result;
+    }
+
+    void output(int port, int w8) {
+        if (this->onwrite) {
+            this->onwrite((uint32_t)port, (uint8_t)w8);
+        }
+        this->outport = port;
+        this->outbyte = w8;
+
+        //if (port == 0x02) {
+        //    this->onmodechange((w8 & 0x10) != 0);
+        //}
+        #if 0
+        /* debug print from guest */
+        switch (port) {
+            case 0x77:  
+                this->str1 += w8.toString(16) + " ";
+                break;
+            case 0x79:
+                if (w8 != 0) {
+                    this->str1 += String.fromCharCode(w8);
+                } else {
+                    console.log(this->str1);
+                    this->str1 = "";
+                }
+        }
+        #endif
+    }
+
+    void sound_emit(SoundEventType type, uint8_t addr, uint8_t value)
+    {
+        if (this->sound_event) {
+            this->sound_event(type, addr, value);
+        }
+    }
+
+    void realoutput(int port, int w8) {
+        bool ruslat;
+        switch (port) {
+            // PIA 
+            case 0x00:
+                this->PIA1_last = w8;
+                ruslat = this->PC & 8;
+                if ((w8 & 0x80) == 0) {
+                    // port C BSR: 
+                    //   bit 0: 1 = set, 0 = reset
+                    //   bit 1-3: bit number
+                    int bit = (w8 >> 1) & 7;
+                    int tapeout_was = this->PC & 1;
+                    if ((w8 & 1) == 1) {
+                        this->PC |= 1 << bit;
+                    } else {
+                        this->PC &= ~(1 << bit);
+                    }
+                    //this->ontapeoutchange(this->PC & 1);
+                    if ((this->PC & 1) != tapeout_was) {
+                        this->sound_emit(SoundEventType::TapeOut, 0,
+                            this->PC & 1);
+                    }
+                } else {
+                    this->CW = w8;
+                    this->realoutput(1, 0);
+                    this->realoutput(2, 0);
+                    this->realoutput(3, 0);
+                }
+                if ((this->PC & 8) != ruslat) {
+                    if (this->ruslat_armed && this->onruslat) {
+                        this->onruslat((this->PC & 8) == 0);
+                    }
+                    this->ruslat_armed = true;
+                }
+                // if (debug) {
+                //     console.log("output commit cw = ", this->CW.toString(16));
+                // }
+                break;
+            case 0x01:
+                {
+                    this->PIA1_last = w8;
+                    ruslat = this->PC & 8;
+                    int tapeout_was = this->PC & 1;
+                    this->PC = w8;
+                    //this->ontapeoutchange(this->PC & 1);
+                    if ((this->PC & 1) != tapeout_was) {
+                        this->sound_emit(SoundEventType::TapeOut, 0,
+                            this->PC & 1);
+                    }
+                    if ((this->PC & 8) != ruslat) {
+                        if (this->ruslat_armed && this->onruslat) {
+                            this->onruslat((this->PC & 8) == 0);
+                        }
+                        this->ruslat_armed = true;
+                    }
+                }
+                break;
+            case 0x02:
+                this->PIA1_last = w8;
+                this->PB = w8;
+                this->onborderchange(this->PB & 0x0f);
+                this->onmodechange((this->PB & 0x10) != 0);
+                break;
+            case 0x03:
+                this->PIA1_last = w8;
+                this->PA = w8;
+                break;
+                // PPI2
+            case 0x04:
+                this->CW2 = w8;
+                break;
+            case 0x05:
+                this->PC2 = w8;
+                break;
+            case 0x06:
+                this->PB2 = w8;
+                break;
+            case 0x07:
+                this->PA2 = w8;
+                this->sound_emit(SoundEventType::Covox, 0, (uint8_t)w8);
+                break;
+
+                // Timer
+            case 0x08:
+            case 0x09:
+            case 0x0a:
+            case 0x0b:
+                this->timer.write((~port & 3), w8);
+                this->sound_emit(SoundEventType::TimerReg,
+                    (uint8_t)(~port & 3), (uint8_t)w8);
+                break;
+
+            case 0x0c:
+            case 0x0d:
+            case 0x0e:
+            case 0x0f:
+                this->palettebyte = w8;
+                break;
+            case 0x10:
+                // kvas 
+                this->kvaz.control_write(w8);
+                break;
+            case 0x14:
+            case 0x15:
+                this->ay.write(port & 1, w8);
+                this->sound_emit(SoundEventType::AyReg,
+                    (uint8_t)(port & 1), (uint8_t)w8);
+                break;
+
+            case 0x18: // fdc data
+                this->fdc.write(3, w8);
+                break;
+            case 0x19: // fdc sector
+                this->fdc.write(2, w8);
+                break;
+            case 0x1a: // fdc track
+                this->fdc.write(1, w8);
+                break;
+            case 0x1b: // fdc command
+                this->fdc.write(0, w8);
+                break;
+            case 0x1c: // fdc control
+                this->fdc.write(4, w8);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void commit() 
+    {
+        if (this->outport != -1) {
+            //printf("commit: %02x = %02x\n", this->outport, this->outbyte);
+            this->realoutput(this->outport, this->outbyte);
+            this->outport = this->outbyte = -1;
+        }
+    }
+
+    void commit_palette(int index) 
+    {
+        int w8 = this->palettebyte;
+        if (w8 == -1 && this->outport == 0x0c) {
+            w8 = this->outbyte;
+            this->outport = this->outbyte = -1;
+        }
+        if (w8 != -1) {
+            /* Plain indexed lookup into the precomputed table; identical
+             * result to the old rgb2pixelformat((w8&7),(w8&0x38)>>3,
+             * (w8&0xc0)>>6) std::function call, without the indirect call
+             * overhead in the per-pixel hot path. */
+            this->palette[index] = this->pix_lut[w8 & 0x1ff];
+            this->palette_raw[index] = (uint8_t)w8;
+            //printf("commit palette: %02x = %02x\n", index, this->palette[index]);
+            this->palettebyte = -1;
+        }
+    }
+
+    int BorderIndex() const 
+    {
+        return this->PB & 0x0f;
+    }
+
+    int ScrollStart() const 
+    {
+        return this->PA;
+    }
+
+    bool Mode512() const 
+    {
+        return (this->PB & 0x10) != 0;
+    }
+
+    int TapeOut() const 
+    {
+        return this->PC & 1;
+    }
+
+    int Covox() const 
+    {
+        return this->PA2;
+    }
+
+    uint32_t Palette(int index) const
+    {
+        return this->palette[index];
+    }
+
+    uint8_t PaletteRaw(int index) const
+    {
+        return this->palette_raw[index];
+    }
+
+    /* Direct read access to the raw palette bytes for the one-shot
+     * fast_framebuffer renderer (PixelFiller::render_full_frame). */
+    const uint8_t * palette_raw_data() const
+    {
+        return this->palette_raw;
+    }
+
+    Keyboard & the_keyboard() const
+    {
+        return this->keyboard;
+    }
+
+    // same as joystick "C", active 0
+    void set_joysticks(int j0e, int j0f)
+    {
+        this->joy_0e = j0e;
+        this->joy_0f = j0f;
+
+        // USPID = PA2
+        uint8_t inv = ~j0e;
+        this->PA2 = ((inv & 0x40) >> 3) | // button
+            ((inv & 0x02) << 3) | // left
+            ((inv & 0x08) << 2) | // down
+            ((inv & 0x01) << 6) | // right
+            ((inv & 0x04) << 5);
+
+        // PU0
+        this->PB2 = j0e;              
+    }
+
+    void serialize(std::vector<uint8_t> & to)
+    {
+        std::vector<uint8_t> tmp;
+        uint8_t * palette_bytes = reinterpret_cast<uint8_t *>(palette);
+        tmp.insert(tmp.end(), palette_bytes, palette_bytes + sizeof(palette));
+        tmp.push_back(CW);
+        tmp.push_back(PA);
+        tmp.push_back(PB);
+        tmp.push_back(PC);
+        tmp.push_back(PIA1_last);
+        tmp.push_back(CW2);
+        tmp.push_back(PA2);
+        tmp.push_back(PB2);
+        tmp.push_back(PC2);
+
+        SerializeChunk::insert_chunk(to, SerializeChunk::IO, tmp);
+    }
+
+    void deserialize(std::vector<uint8_t>::iterator it, uint32_t size)
+    {
+        std::copy(it, it + sizeof(this->palette), reinterpret_cast<uint8_t *>(this->palette));
+        it += sizeof(palette);
+        /* Rebuild the raw palette bytes: the saved state only carries
+         * the expanded values. The inversion matches the fixed PSP 8888
+         * format of TV::get_rgb2pixelformat(). */
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t c = this->palette[i];
+            const int r = (c >> 0) & 0xff;
+            const int g = (c >> 8) & 0xff;
+            const int b = (c >> 16) & 0xff;
+            this->palette_raw[i] =
+                (uint8_t)((r >> 5) | ((g >> 5) << 3) | ((b >> 6) << 6));
+        }
+        CW = *it++;
+        PA = *it++;
+        PB = *it++;
+        PC = *it++;
+        PIA1_last = *it++;
+        CW2 = *it++;
+        PA2 = *it++;
+        PB2 = *it++;
+        PC2 = *it++;
+
+        if (this->onmodechange) this->onmodechange((this->PB & 0x10) != 0);
+        if (this->onborderchange) this->onborderchange(this->PB & 0x0f);
+        if (this->onruslat) this->onruslat((this->PC & 8) == 0);
+    }
+};

@@ -1,0 +1,16 @@
+# vim turds
+*.swp
+tags
+
+# Build artifacts
+*.o
+*.elf
+EBOOT.PBP
+PARAM.SFO
+release/EBOOT.PBP
+release/BOOT.PBP
+assets/logo_data.c
+
+# Sound-mode test artifacts
+sound_mode_results/
+__pycache__/

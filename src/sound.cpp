@@ -1,0 +1,902 @@
+#include <algorithm>
+#include <cstring>
+#include "8253.h"
+#include "ay.h"
+#include "wav.h"
+#include "options.h"
+#include "sound.h"
+#include "sound_filters.h"
+#include "ay_decim_coef.h"
+#include "debuglog.h"
+
+#include <pspaudiolib.h>
+#include <pspaudio.h>
+#include <pspkernel.h>
+
+/* PSP Audio: 44100 Hz stereo, 16-bit */
+#define PSP_AUDIO_SAMPLE_RATE 44100
+#define PSP_AUDIO_CHANNELS 2
+
+static bool audio_initialized = false;
+
+void Soundnik::init(WavRecorder * _rec_internal, WavRecorder * _rec_callback)
+{
+    this->rec_internal = _rec_internal;
+    this->rec_callback = _rec_callback;
+
+    /* Waveform reconstruction kernel (config.ini: sound_mode). Chosen
+     * once here, before pspAudioSetChannelCallback() registers the
+     * audio callback below: the hot loop only ever sees the enum and
+     * the prebuilt coefficient tables. */
+    this->sound_mode = Options.sound_mode;
+    sound_filters::init_tables();
+    dbglog("snd: sound_mode=%s\n",
+           sound_filters::mode_name(this->sound_mode));
+
+    if (Options.nosound) {
+        return;
+    }
+
+    this->sampleRate = PSP_AUDIO_SAMPLE_RATE;
+    this->sound_frame_size = this->sampleRate / 50;
+
+    /* Target ring fill from sound_buffer_ms (config.ini), clamped to
+     * the ring capacity; the default 40 ms reproduces the previous
+     * fixed TARGET_FILL = 1764. */
+    int buf_ms = Options.sound_buffer_ms;
+    if (buf_ms < 1) buf_ms = 1;
+    if (buf_ms > 150) buf_ms = 150;
+    this->target_fill =
+        (uint32_t)((uint64_t)this->sampleRate * (uint32_t)buf_ms / 1000u);
+    dbglog("snd: sound_buffer_ms=%d target_fill=%u frames (~%d ms)\n",
+           buf_ms, (unsigned)this->target_fill,
+           (int)(this->target_fill * 1000 / (uint32_t)this->sampleRate));
+
+    this->cps_whole = SOUND_CLOCK_RATE / this->sampleRate;
+    this->cps_frac_num = SOUND_CLOCK_RATE % this->sampleRate;
+    this->cps_frac_acc = 0;
+    this->inv_dt_lo = 1.0f / (float)this->cps_whole;
+    this->inv_dt_hi = 1.0f / (float)(this->cps_whole + 1);
+
+    /* Initialize PSP Audio */
+    if (!audio_initialized) {
+        pspAudioInit();
+        pspAudioSetChannelCallback(0, Soundnik::callback, (void *)this);
+        audio_initialized = true;
+    }
+}
+
+void Soundnik::set_buffer_ms(int ms)
+{
+    if (ms < 1) ms = 1;
+    if (ms > 150) ms = 150;
+    if (this->sampleRate <= 0) {
+        return;  /* sound not initialized */
+    }
+    this->target_fill =
+        (uint32_t)((uint64_t)this->sampleRate * (uint32_t)ms / 1000u);
+    dbglog("snd: sound_buffer_ms=%d target_fill=%u frames (~%d ms)\n",
+           ms, (unsigned)this->target_fill,
+           (int)(this->target_fill * 1000 / (uint32_t)this->sampleRate));
+}
+
+void Soundnik::pause(int pause)
+{
+    if (!Options.nosound) {
+        /* PSP audio doesn't have a simple pause; drain the ring */
+    }
+    this->rd_frame = this->wr_total.load(std::memory_order_relaxed);
+    this->rd_frac = 0;
+    this->step_frac = Soundnik::STEP_ONE;
+    this->rate_int = 0;
+    this->pf_last_us = 0;
+    if (this->sound_frame_size > 0) {
+        this->rdbuf = (int)(this->rd_frame
+            % (uint64_t)(NBUFFERS * this->sound_frame_size))
+            / this->sound_frame_size;
+        this->rdpos = (int)(this->rd_frame
+            % (uint32_t)this->sound_frame_size);
+    }
+}
+
+/* Called by the PSP audio thread.
+ * PSP Audio expects 16-bit signed stereo samples.
+ *
+ * The ring holds float stereo frames produced by process_frame(); the
+ * hardware always pulls reqn frames per call at a fixed 44100 Hz. The
+ * generator rate follows the machine, which under load runs slightly
+ * slower than wall clock, so the callback resamples the ring with an
+ * adaptive fractional step around 1.0 (dynamic rate control): when the
+ * fill level drops below the target the step slows down, when it grows
+ * the step speeds up. The output is continuous at exactly the hardware
+ * rate; nothing is ever repeated or skipped in chunks. */
+void Soundnik::callback(void * buf, unsigned int reqn, void * pdata)
+{
+    Soundnik * that = (Soundnik *)pdata;
+    short * sstream = (short *)buf;
+    const int sample_count = (int)reqn; /* stereo frames requested */
+
+    const uint64_t wr = that->wr_total.load(std::memory_order_acquire);
+    const int frame_size = that->sound_frame_size;
+    const uint32_t now_us = sceKernelGetSystemTimeLow();
+
+    /* PI controller on the fill level. A sustained machine-rate
+     * deficit (the worker below 50 fps) can only be absorbed by the
+     * integrator: the proportional part damps, the integral part
+     * settles the step at whatever ratio keeps the ring at the target.
+     * Gains give a critically damped loop with ~10 rad/s bandwidth;
+     * all math is fixed-point integer. */
+    const int err = (int)(wr - that->rd_frame)
+        - (int)that->target_fill;
+    that->rate_int += err;
+    /* Clamp the integrator to the step range (anti-windup) */
+    if (that->rate_int < -(int64_t)5040000) that->rate_int = -(int64_t)5040000;
+    if (that->rate_int >  (int64_t)1580000) that->rate_int =  (int64_t)1580000;
+    int step = (int)Soundnik::STEP_ONE
+        + ((err * 30) >> 10)                       /* P: ~3% of range */
+        + (int)((that->rate_int * 149) >> 16);     /* I */
+    if (step < (int)Soundnik::STEP_MIN) step = (int)Soundnik::STEP_MIN;
+    if (step > (int)Soundnik::STEP_MAX) step = (int)Soundnik::STEP_MAX;
+    that->step_frac = (uint32_t)step;
+
+    /* Run-wide statistics (single writer: the audio thread). fill is
+     * sampled at the callback entry, i.e. before this call consumes
+     * anything; the latency is the time the block currently under the
+     * read head has spent in the ring. */
+    const uint64_t fill0 = wr - that->rd_frame;
+    if (fill0 < that->stat_fill_min) that->stat_fill_min = fill0;
+    if (fill0 > that->stat_fill_max) that->stat_fill_max = fill0;
+    that->stat_fill_sum += fill0;
+    ++that->stat_fill_n;
+
+    if ((uint32_t)step < that->stat_step_min) that->stat_step_min = (uint32_t)step;
+    if ((uint32_t)step > that->stat_step_max) that->stat_step_max = (uint32_t)step;
+    that->stat_step_sum += (uint32_t)step;
+    ++that->stat_step_n;
+    if (step == (int)Soundnik::STEP_MIN) ++that->stat_step_at_min;
+    if (step == (int)Soundnik::STEP_MAX) ++that->stat_step_at_max;
+    if (step != (int)Soundnik::STEP_ONE) ++that->stat_step_not_one;
+
+    if (that->rate_int < that->stat_rint_min) that->stat_rint_min = that->rate_int;
+    if (that->rate_int > that->stat_rint_max) that->stat_rint_max = that->rate_int;
+
+    if (frame_size > 0 && wr > 0) {
+        const uint32_t blk = (uint32_t)
+            ((that->rd_frame / (uint64_t)frame_size) % NBUFFERS);
+        const uint32_t ts = that->wr_block_ts[blk];
+        if (ts != 0) {
+            const uint64_t lat_us = now_us - ts;
+            if (lat_us < that->stat_lat_min) that->stat_lat_min = lat_us;
+            if (lat_us > that->stat_lat_max) that->stat_lat_max = lat_us;
+            that->stat_lat_sum += lat_us;
+            ++that->stat_lat_n;
+        }
+    }
+
+    /* Reconstruction kernel, selected once at startup (config.ini:
+     * sound_mode). All kernels reconstruct the same ring frames at
+     * the same fractional phase, so the number of output frames, the
+     * PI controller and the timing are identical for every mode. The
+     * wider kernels never read past the writer or before frame 0:
+     * edge taps repeat the nearest available sample. */
+    const SoundMode mode = that->sound_mode;
+
+    for (int i = 0; i < sample_count; ++i) {
+        float samp;
+        if (that->rd_frame >= wr) {
+            /* The machine has not generated this sample yet: hold the
+             * level and re-anchor right behind the writer, keeping the
+             * step at its catch-up maximum so the ring refills. */
+            samp = that->last_value;
+            ++that->underrun_frames;
+            ++that->stat_underrun_total;
+            if (++that->stat_underrun_run > that->stat_underrun_max_run) {
+                that->stat_underrun_max_run = that->stat_underrun_run;
+            }
+            that->rd_frame = wr > 0 ? wr - 1 : 0;
+            that->rd_frac = 0;
+            that->rdbuf = (int)(that->rd_frame
+                % (uint64_t)(NBUFFERS * frame_size)) / frame_size;
+            that->rdpos = (int)(that->rd_frame % (uint32_t)frame_size);
+        } else {
+            that->stat_underrun_run = 0;
+            const float s0 = that->buffer[that->rdbuf][that->rdpos];
+            const uint32_t frac = that->rd_frac;
+
+            if (mode == SoundMode::None) {
+                /* Reference: linear interpolation between consecutive
+                 * ring frames, read strictly below the writer
+                 * position. Unchanged historical code path. */
+                uint64_t next = that->rd_frame + 1;
+                float s1;
+                if (next < wr) {
+                    int nb = that->rdbuf, np = that->rdpos + 1;
+                    if (np >= frame_size) {
+                        np = 0;
+                        if (++nb == NBUFFERS) nb = 0;
+                    }
+                    s1 = that->buffer[nb][np];
+                } else {
+                    s1 = s0; /* do not peek past the writer */
+                }
+                samp = s0 + (s1 - s0) * ((float)frac * (1.0f / 65536.0f));
+            } else {
+                const float t = (float)frac * (1.0f / 65536.0f);
+
+                /* Previous frame: at the very beginning of the ring
+                 * (start of playback or right after an underrun
+                 * re-anchor) no valid earlier data exists, so the tap
+                 * repeats s0. */
+                float p0 = s0;
+                if (that->rd_frame > 0) {
+                    int pb = that->rdbuf, pp = that->rdpos - 1;
+                    if (pp < 0) {
+                        pp = frame_size - 1;
+                        if (--pb < 0) pb = NBUFFERS - 1;
+                    }
+                    p0 = that->buffer[pb][pp];
+                }
+
+                /* Next frame, never peeking past the writer */
+                float s1 = s0;
+                int nb = that->rdbuf, np = that->rdpos;
+                if (that->rd_frame + 1 < wr) {
+                    if (++np >= frame_size) {
+                        np = 0;
+                        if (++nb == NBUFFERS) nb = 0;
+                    }
+                    s1 = that->buffer[nb][np];
+                }
+
+                if (mode == SoundMode::Cubic
+                        || mode == SoundMode::Gaussian) {
+                    /* Fourth point (current + 2): repeats the last
+                     * available sample when the writer is closer. */
+                    float p3 = s1;
+                    if (that->rd_frame + 2 < wr) {
+                        if (++np >= frame_size) {
+                            np = 0;
+                            if (++nb == NBUFFERS) nb = 0;
+                        }
+                        p3 = that->buffer[nb][np];
+                    }
+                    samp = (mode == SoundMode::Cubic)
+                        ? sound_filters::cubic(p0, s0, s1, p3, t)
+                        : sound_filters::gaussian(p0, s0, s1, p3, t);
+                } else {
+                    /* Sinc: taps rd_frame-3..rd_frame+4. Missing taps
+                     * on either side repeat the nearest valid sample
+                     * (edge clamping): the fill controller keeps the
+                     * read head well inside the ring, so this only
+                     * happens at playback start and while catching up
+                     * to the writer, where the phase sits near 0 and
+                     * the kernel is near-identity anyway. */
+                    float lt[3]; /* rd_frame-1, -2, -3 */
+                    {
+                        int lb = that->rdbuf, lp = that->rdpos;
+                        float lastv = s0;
+                        for (int d = 1; d <= 3; ++d) {
+                            if (that->rd_frame >= (uint64_t)d) {
+                                if (--lp < 0) {
+                                    lp = frame_size - 1;
+                                    if (--lb < 0) lb = NBUFFERS - 1;
+                                }
+                                lastv = that->buffer[lb][lp];
+                            }
+                            lt[d - 1] = lastv;
+                        }
+                    }
+                    float rt[4]; /* rd_frame+1, +2, +3, +4 */
+                    {
+                        int rb = that->rdbuf, rp = that->rdpos;
+                        float lastv = s0;
+                        for (int d = 1; d <= 4; ++d) {
+                            if (that->rd_frame + (uint64_t)d < wr) {
+                                if (++rp >= frame_size) {
+                                    rp = 0;
+                                    if (++rb == NBUFFERS) rb = 0;
+                                }
+                                lastv = that->buffer[rb][rp];
+                            }
+                            rt[d - 1] = lastv;
+                        }
+                    }
+                    samp = sound_filters::sinc8(
+                        lt[2], lt[1], lt[0], s0,
+                        rt[0], rt[1], rt[2], rt[3], t);
+                }
+            }
+            that->last_value = samp;
+
+            that->rd_frac += that->step_frac;
+            uint32_t adv = that->rd_frac >> 16;
+            that->rd_frac &= 0xffffu;
+            that->rd_frame += adv;
+            that->rdpos += (int)adv;
+            while (that->rdpos >= frame_size) {
+                that->rdpos -= frame_size;
+                if (++that->rdbuf == NBUFFERS) that->rdbuf = 0;
+            }
+        }
+
+        /* Convert float (-1..1) to 16-bit signed */
+        int v = (int)(samp * 32767.0f);
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        sstream[i * 2] = (short)v;
+        sstream[i * 2 + 1] = (short)v;
+    }
+
+    /* Diagnostic: capture exactly the interleaved 16-bit stereo frames
+     * the callback hands to the PSP audio hardware. */
+    if (that->rec_callback != 0) {
+        that->rec_callback->record_shorts(
+            sstream, (size_t)sample_count * PSP_AUDIO_CHANNELS);
+
+        /* Once-a-second health line (only while recording): fill level,
+         * playback step in %, and underrun padding since the last line */
+        static uint32_t last_report_us = 0;
+        const uint32_t now = now_us;
+        if ((uint32_t)(now - last_report_us) >= 1000000) {
+            last_report_us = now;
+            dbglog("snd_cb: fill=%d step=%u.%02u%% underrun=%u\n",
+                   (int)(that->wr_total.load(std::memory_order_relaxed)
+                         - that->rd_frame),
+                   (unsigned)(that->step_frac * 100 / Soundnik::STEP_ONE),
+                   (unsigned)((that->step_frac * 10000 / Soundnik::STEP_ONE) % 100),
+                   (unsigned)that->underrun_frames);
+            that->underrun_frames = 0;
+        }
+    }
+}
+
+void Soundnik::sample(float samp)
+{
+    if (!Options.nosound) {
+        this->last_value = samp;
+        const int frame_size = this->sound_frame_size;
+        /* Latency stamp at the start of each block */
+        if (this->wr_pos == 0) {
+            this->wr_block_ts[this->wr_buf_idx] =
+                sceKernelGetSystemTimeLow();
+        }
+        /* Mono ring: single store per frame, incremental position */
+        this->buffer[this->wr_buf_idx][this->wr_pos] = samp;
+        if (++this->wr_pos >= frame_size) {
+            this->wr_pos = 0;
+            if (++this->wr_buf_idx == NBUFFERS) this->wr_buf_idx = 0;
+        }
+        this->wr_total.fetch_add(1, std::memory_order_release);
+
+        /* Diagnostic: capture the sample at the Soundnik -> ring buffer
+         * boundary, converted with the exact same float->short math the
+         * audio callback uses, so the two recordings are comparable. */
+        if (this->rec_internal != 0) {
+            int v = (int)(samp * 32767.0f);
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            int16_t pair[2] = { (int16_t)v, (int16_t)v };
+            this->rec_internal->record_shorts(pair, 2);
+        }
+    }
+}
+
+/* --- event-based block generation --- */
+
+void Soundnik::push_event(SoundEventType type, uint8_t addr, uint8_t value)
+{
+    SoundEvent e;
+    e.clock = this->sound_clock;
+    e.type = type;
+    e.addr = addr;
+    e.value = value;
+    this->events.push(e);
+}
+
+void Soundnik::apply_event(const SoundEvent & e)
+{
+    switch (e.type) {
+        case SoundEventType::TimerReg:
+            this->apply_timer_write(e.addr, e.value);
+            break;
+        case SoundEventType::AyReg:
+            this->mirror_ay.write(e.addr, e.value);
+            break;
+        case SoundEventType::TapeOut:
+            this->tapeout_level = e.value ? 1 : 0;
+            break;
+        case SoundEventType::TapeIn:
+            this->tapein_level = e.value ? 1 : 0;
+            break;
+        case SoundEventType::Covox:
+            this->covox_level = e.value;
+            this->covox_norm = ((int)e.value - 255) * (1.0f / 256.0f);
+            break;
+    }
+}
+
+/* Replay an 8253 write on the timer mirror. Tracks only what is needed
+ * for sound generation (mode, load value, output phase); the fine
+ * read/latch delays of CounterUnit are skipped because they are
+ * inaudible. */
+void Soundnik::apply_timer_write(int addr, uint8_t w8)
+{
+    if (addr == 3) {
+        /* control word */
+        int counter = (w8 >> 6) & 3;
+        if (counter >= 3) {
+            return; /* read-back command: not modeled */
+        }
+        int latch = (w8 >> 4) & 3;
+        if (latch == 0) {
+            return; /* counter latch command: only affects reads */
+        }
+
+        TimerChannel & ch = this->timer_ch[counter];
+        int m = (w8 >> 1) & 3;
+        ch.mode = (m == 2) ? 2 : (m == 3) ? 3 : m;
+        ch.bcd = (w8 & 1) != 0;
+        ch.latch_mode = latch;
+        ch.write_state = 0;
+        ch.enabled = false;
+        ch.out = (ch.mode == 0) ? 0 : 1;
+        ch.value = 0;
+        ch.delay = 0;
+        ch.armed = (ch.mode == 0);
+        ch.load = false;
+        ch.phase = 0;
+        ch.remain = 0;
+        return;
+    }
+
+    if (addr < 0 || addr >= 3) {
+        return;
+    }
+    TimerChannel & ch = this->timer_ch[addr];
+    if (ch.latch_mode == 0) {
+        return;
+    }
+
+    int loadvalue = -1;
+    if (ch.latch_mode == 3) {
+        if (ch.write_state == 0) {
+            ch.write_lsb = w8;
+            ch.write_state = 1;
+            return;
+        }
+        ch.write_state = 0;
+        loadvalue = (w8 << 8) | ch.write_lsb;
+    } else if (ch.latch_mode == 1) {
+        loadvalue = w8;
+    } else {
+        loadvalue = w8 << 8;  /* latch_mode 2: msb only */
+    }
+
+    if (ch.bcd) {
+        loadvalue = CounterUnit::frombcd((uint16_t)loadvalue);
+    }
+    ch.loadvalue = loadvalue;
+    ch.load = true;
+
+    /* Delay semantics from CounterUnit::write_value():
+     * mode 0: always delay=3
+     * modes 2,3: delay=3 only when !enabled (already counting = no delay)
+     * mode 1: delay=3 only when !enabled
+     * other: delay=4 */
+    switch (ch.mode) {
+        case 0: ch.delay = 3; break;
+        case 1: if (!ch.enabled) ch.delay = 3; break;
+        case 2: if (!ch.enabled) ch.delay = 3; break;
+        case 3: if (!ch.enabled) ch.delay = 3; break;
+        default: ch.delay = 4; break;
+    }
+}
+
+/* Number of clocks (out of dt) the timer channel output spends high.
+ * Advances the channel state. Faithful reproduction of CounterUnit
+ * from src/8253.h: delay mechanism, load semantics, mode 3 asymmetric
+ * square wave for odd divisors, mode 0 terminal count timing.
+ * All-integer math: the PSP FPU emulates 64-bit doubles in software. */
+int Soundnik::integrate_timer(int n, int dt)
+{
+    TimerChannel & ch = this->timer_ch[n];
+
+    /* Consume write-delay clocks (CounterUnit delay semantics).
+     * During delay, the counter does not count; OUT stays constant. */
+    if (ch.delay > 0) {
+        if (ch.delay >= dt) {
+            ch.delay -= dt;
+            return ch.out ? dt : 0;
+        }
+        int active = dt - ch.delay;
+        ch.delay = 0;
+        dt = active;
+        if (dt <= 0) return ch.out ? (dt + ch.delay) : 0;
+    }
+
+    if (!ch.enabled && !ch.load) {
+        return ch.out ? dt : 0;
+    }
+
+    switch (ch.mode) {
+        case 0: {
+            /* Interrupt on terminal count.
+             * CounterUnit::Count() returns result AFTER the transition:
+             * when value reaches 0, out is set to 1 and result=1 in the
+             * SAME call.  We mirror that here. */
+            if (ch.load) {
+                ch.value = ch.loadvalue;
+                ch.enabled = true;
+                ch.armed = true;
+                ch.out = 0;
+                ch.load = false;
+            }
+            if (!ch.enabled) return 0;
+            if (ch.out) return dt;
+
+            int high = 0;
+            int rem = dt;
+            int prev = ch.value;
+            ch.value -= rem;
+            if (ch.value <= 0 && ch.armed && prev > 0) {
+                ch.armed = false;
+                ch.out = 1;
+                ch.value += ch.bcd ? 10000 : 65536;
+                /* Match reference: return out AFTER transition.
+                 * For dt=1: return 1 (the new out).
+                 * For dt>1: count clocks at out=1 after transition. */
+                high = (rem >= prev) ? (rem - prev + 1) : 0;
+            }
+            return high;
+        }
+        case 2:
+            /* Rate generator: one-clock low pulse per period.
+             * The pulse is inaudible; keep the DC level. */
+            return dt;
+        case 3: {
+            /* Square wave generator.
+             * Counter decrements by 2 per clock (by 1 or 3 at boundaries
+             * for odd loadvalue). OUT toggles when value <= 0.
+             *
+             * Post-toggle value semantics: the reference does
+             *   value += reload  (where reload = loadvalue or 65536)
+             * from the negative value.  For even load the result equals
+             * load, but for odd load it is load-1.  This difference is
+             * what makes the asymmetric square wave work. */
+            if (!ch.enabled && ch.load) {
+                ch.value = ch.loadvalue;
+                ch.enabled = true;
+                ch.load = false;
+            }
+            if (!ch.enabled) return ch.out ? dt : 0;
+
+            int load = ch.loadvalue ? ch.loadvalue : 65536;
+            int high = 0;
+            int rem = dt;
+
+            while (rem > 0) {
+                int dur;
+                if (ch.out && ch.value == load && (load & 1))
+                    dur = (load + 1) / 2;
+                else
+                    dur = (ch.value + 1) / 2;
+                if (dur < 1) dur = 1;
+
+                if (dur > rem) {
+                    if (ch.out) high += rem;
+                    ch.value -= 2 * rem;
+                    rem = 0;
+                } else {
+                    if (ch.out) high += dur;
+                    rem -= dur;
+                    ch.out ^= 1;
+                    /* Post-toggle value: value = -(2*dur - old_value) + load
+                     * Simplified: for odd load after high: load-1;
+                     *             for even load after high: load;
+                     *             after low (any load): load. */
+                    if (ch.out) {
+                        /* just toggled to out=1 (was low) */
+                        ch.value = load;
+                    } else {
+                        /* just toggled to out=0 (was high)
+                         * odd load: load-1, even load: load */
+                        ch.value = load - (load & 1);
+                    }
+                }
+            }
+            return high;
+        }
+        default:
+            return ch.out ? dt : 0;
+    }
+}
+
+/* Step the AY mirror for dt sound clocks and return the anti-aliased
+ * output. Tick rate matches the legacy AYWrapper::step2(): 14 accumulator
+ * units per 1.5 MHz clock, one chip step per 96 units (~218.75 kHz). The
+ * chip runs its integer state machine (step_int); every chip sample is
+ * pushed into a circular history and a windowed-sinc low-pass is
+ * evaluated once per output sample. This is the anti-alias decimation the
+ * old single-period box average lacked: the box had its first null at
+ * ~44 kHz, so AY harmonics between the 22.05 kHz output Nyquist and the
+ * 109 kHz chip Nyquist aliased back into the audible band (hissing tones).
+ * The FIR (~18 kHz cutoff, unity DC gain) removes them and preserves the
+ * AY level, so no volume change is needed. */
+float Soundnik::step_ay(int dt, int ena0, int ena1, int ena2)
+{
+    static_assert(AY_DECIM_TAPS == AY_HIST_LEN,
+                  "AY decimator tap count must match the history buffer");
+
+    this->ay_accu += dt * 14;
+    int steps = this->ay_accu / 96;
+    this->ay_accu -= steps * 96;
+
+    if (steps == 0) {
+        return this->ay_last;
+    }
+
+#ifdef AUTOSELECT_ROM
+    unsigned perf_a0 = sceKernelGetSystemTimeLow();
+#endif
+    const int mask = AY_HIST_LEN - 1;
+
+    /* steps is 4..5 for dt = 33..34 clocks: push each chip sample into
+     * the ring. step_int returns the raw sum of the three channel levels
+     * (0..3*4096); the 1/4096 restores the 0..3 float scale the mixer
+     * expects, exactly as the old box average did. */
+    int pos = this->ay_hist_pos;
+    for (int i = 0; i < steps; ++i) {
+        this->ay_hist[pos] =
+            this->mirror_ay.step_int(ena0, ena1, ena2) * (1.0f / 4096.0f);
+        pos = (pos + 1) & mask;
+    }
+    this->ay_hist_pos = pos;   /* now points at the oldest sample */
+
+    /* One FIR evaluation per output sample: dot the whole history with
+     * the coefficients, oldest -> newest. The filter is symmetric, so the
+     * traversal order is irrelevant. */
+    float acc = 0.0f;
+    int idx = this->ay_hist_pos;
+    for (int k = 0; k < AY_DECIM_TAPS; ++k) {
+        acc += ay_decim_coef[k] * this->ay_hist[idx];
+        idx = (idx + 1) & mask;
+    }
+#ifdef AUTOSELECT_ROM
+    this->perf_ay_us += sceKernelGetSystemTimeLow() - perf_a0;
+    this->perf_naysteps += steps;
+#endif
+    this->ay_last = acc;
+    return this->ay_last;
+}
+
+/* Length of the next output sample in sound clocks. Accumulates the
+ * fractional part of SOUND_CLOCK_RATE / sampleRate Bresenham-style, so
+ * samples are 33 or 34 clocks and average out exactly. */
+int Soundnik::next_sample_dt()
+{
+    int dt = this->cps_whole;
+    this->cps_frac_acc += this->cps_frac_num;
+    if (this->cps_frac_acc >= this->sampleRate) {
+        this->cps_frac_acc -= this->sampleRate;
+        dt += 1;
+    }
+    return dt;
+}
+
+/* Render output samples for all clocks executed since the previous call.
+ * Typically once per frame: ~29952 clocks -> 882 samples at 44100 Hz. */
+void Soundnik::process_frame()
+{
+    if (Options.nosound) {
+        /* keep the queue drained so it cannot overflow */
+        this->events.clear();
+        return;
+    }
+
+    /* Pacing statistics: interval between consecutive process_frame
+     * calls. Nominally 20 ms; bursty arrivals fill the ring faster
+     * than the callback drains it even at an average of 50 fps. */
+    const uint32_t pf_now = sceKernelGetSystemTimeLow();
+    if (this->pf_last_us != 0) {
+        const uint32_t d = pf_now - this->pf_last_us;
+        if (d < this->stat_pf_min) this->stat_pf_min = d;
+        if (d > this->stat_pf_max) this->stat_pf_max = d;
+        this->stat_pf_sum += d;
+        ++this->stat_pf_n;
+    }
+    this->pf_last_us = pf_now;
+
+    int ech0 = Options.enable.timer_ch0,
+        ech1 = Options.enable.timer_ch1,
+        ech2 = Options.enable.timer_ch2,
+        aych0 = Options.enable.ay_ch0,
+        aych1 = Options.enable.ay_ch1,
+        aych2 = Options.enable.ay_ch2;
+
+    /* Snapshot the volumes once: they do not change inside a frame,
+     * and folding global in here removes a multiply per sample. */
+    const float vol_timer = Options.volume.timer * Options.volume.global;
+    const float vol_ay = Options.volume.ay * Options.volume.global;
+    const float vol_beeper = Options.volume.beeper * Options.volume.global;
+    const float vol_covox = Options.volume.covox * Options.volume.global;
+
+    int budget = 8 * this->sound_frame_size; /* max samples per call */
+
+    while (this->next_sample_clock <= this->sound_clock
+            && budget-- > 0) {
+        const uint64_t t1 = this->next_sample_clock;
+
+        /* apply everything the CPU committed up to this sample boundary */
+#ifdef AUTOSELECT_ROM
+        unsigned perf_e0 = sceKernelGetSystemTimeLow();
+#endif
+        while (!this->events.empty()
+                && this->events.peek().clock <= t1) {
+            this->apply_event(this->events.peek());
+            this->events.pop();
+        }
+#ifdef AUTOSELECT_ROM
+        unsigned perf_e1 = sceKernelGetSystemTimeLow();
+        this->perf_ev_us += perf_e1 - perf_e0;
+#endif
+
+        const int dt = this->next_sample_dt();
+
+#ifdef AUTOSELECT_ROM
+        unsigned perf_t0 = sceKernelGetSystemTimeLow();
+#endif
+        const int high =
+            this->integrate_timer(0, dt) * ech0 +
+            this->integrate_timer(1, dt) * ech1 +
+            this->integrate_timer(2, dt) * ech2;
+#ifdef AUTOSELECT_ROM
+        unsigned perf_t1 = sceKernelGetSystemTimeLow();
+        this->perf_tmr_us += perf_t1 - perf_t0;
+#endif
+
+        const float inv_dt = (dt == this->cps_whole)
+            ? this->inv_dt_lo : this->inv_dt_hi;
+
+#ifdef AUTOSELECT_ROM
+        unsigned perf_m0 = sceKernelGetSystemTimeLow();
+#endif
+        float s = (float)high * inv_dt * vol_timer
+            + this->step_ay(dt, aych0, aych1, aych2) * vol_ay
+            + (this->tapeout_level + this->tapein_level) * vol_beeper
+            + vol_covox * this->covox_norm;
+
+        if (s < -1.0f) s = -1.0f;
+        if (s > 1.0f) s = 1.0f;
+        this->sample(s);
+#ifdef AUTOSELECT_ROM
+        this->perf_mix_us += sceKernelGetSystemTimeLow() - perf_m0;
+        ++this->perf_nsamples;
+#endif
+
+        this->next_sample_clock += dt;
+    }
+
+    if (this->next_sample_clock <= this->sound_clock) {
+        /* fell too far behind: skip ahead, replaying queued events so the
+         * chip mirrors stay in sync with the CPU */
+        while (!this->events.empty()
+                && this->events.peek().clock <= this->sound_clock) {
+            this->apply_event(this->events.peek());
+            this->events.pop();
+        }
+        this->next_sample_clock = this->sound_clock;
+    }
+}
+
+/* Run-wide sound statistics (diagnostic ТЗ sections 2..5, 11, 13) */
+void Soundnik::report_stats()
+{
+    if (Options.nosound) {
+        return;
+    }
+    const uint32_t cap = (uint32_t)(NBUFFERS * this->sound_frame_size);
+    dbglog("Sound statistics:\n");
+    dbglog("  sample rate:        %d Hz\n", this->sampleRate);
+    dbglog("  sound_frame_size:   %d frames/block\n", this->sound_frame_size);
+    dbglog("  ring capacity:      %u frames (~%u ms)\n",
+           (unsigned)cap, (unsigned)(cap * 1000 / 44100));
+    dbglog("  target_fill:        %u frames (~%u ms)\n",
+           (unsigned)this->target_fill,
+           this->sampleRate ? (unsigned)(this->target_fill * 1000
+               / (uint32_t)this->sampleRate) : 0u);
+    if (this->stat_fill_n > 0) {
+        dbglog("  fill min:           %lu\n", (unsigned long)this->stat_fill_min);
+        dbglog("  fill max:           %lu\n", (unsigned long)this->stat_fill_max);
+        dbglog("  fill avg:           %lu\n",
+               (unsigned long)(this->stat_fill_sum / this->stat_fill_n));
+        dbglog("  fill measurements:  %lu callbacks\n",
+               (unsigned long)this->stat_fill_n);
+    }
+    dbglog("  STEP_ONE:           %u\n", (unsigned)Soundnik::STEP_ONE);
+    dbglog("  STEP_MIN:           %u\n", (unsigned)Soundnik::STEP_MIN);
+    dbglog("  STEP_MAX:           %u\n", (unsigned)Soundnik::STEP_MAX);
+    if (this->stat_step_n > 0) {
+        dbglog("  step min:           %lu\n", (unsigned long)this->stat_step_min);
+        dbglog("  step max:           %lu\n", (unsigned long)this->stat_step_max);
+        dbglog("  step avg:           %lu\n",
+               (unsigned long)(this->stat_step_sum / this->stat_step_n));
+        dbglog("  step == STEP_MIN:   %lu callbacks\n",
+               (unsigned long)this->stat_step_at_min);
+        dbglog("  step == STEP_MAX:   %lu callbacks\n",
+               (unsigned long)this->stat_step_at_max);
+        dbglog("  step != STEP_ONE:   %lu of %lu callbacks\n",
+               (unsigned long)this->stat_step_not_one,
+               (unsigned long)this->stat_step_n);
+    }
+    if (this->stat_rint_min <= this->stat_rint_max) {
+        dbglog("  rate_int min:       %lld\n", (long long)this->stat_rint_min);
+        dbglog("  rate_int max:       %lld (clamped to +/-5040000/1580000)\n",
+               (long long)this->stat_rint_max);
+    }
+    dbglog("  underrun frames:    %lu total, longest run %lu\n",
+           (unsigned long)this->stat_underrun_total,
+           (unsigned long)this->stat_underrun_max_run);
+    if (this->stat_lat_n > 0) {
+        dbglog("  buffer latency ms:  min=%lu max=%lu avg=%lu (%lu samples)\n",
+               (unsigned long)(this->stat_lat_min / 1000),
+               (unsigned long)(this->stat_lat_max / 1000),
+               (unsigned long)(this->stat_lat_sum / this->stat_lat_n / 1000),
+               (unsigned long)this->stat_lat_n);
+    }
+    if (this->stat_pf_n > 0) {
+        dbglog("  process_frame gap ms: min=%lu max=%lu avg=%lu.%03lu (%lu calls)\n",
+               (unsigned long)(this->stat_pf_min / 1000),
+               (unsigned long)(this->stat_pf_max / 1000),
+               (unsigned long)(this->stat_pf_sum / this->stat_pf_n / 1000),
+               (unsigned long)((this->stat_pf_sum / this->stat_pf_n) % 1000),
+               (unsigned long)this->stat_pf_n);
+    }
+    dbglog("  events dropped:     %d (queue overflow)\n", this->events.dropped);
+}
+
+void Soundnik::reset()
+{
+    this->timerwrapper.reset();
+    this->aywrapper.reset();
+
+    this->events.clear();
+    this->sound_clock = 0;
+    this->cps_frac_acc = 0;
+    this->next_sample_clock = 0;
+    this->reset_mirrors();
+}
+
+void Soundnik::reset_mirrors()
+{
+    this->mirror_ay.init();
+    this->ay_accu = 0;
+    this->ay_last = 0;
+    for (int i = 0; i < AY_HIST_LEN; ++i) {
+        this->ay_hist[i] = 0.0f;
+    }
+    this->ay_hist_pos = 0;
+
+    for (int i = 0; i < 3; ++i) {
+        TimerChannel & ch = this->timer_ch[i];
+        ch.mode = 0;
+        ch.latch_mode = 0;
+        ch.bcd = false;
+        ch.write_state = 0;
+        ch.write_lsb = 0;
+        ch.loadvalue = 0;
+        ch.enabled = false;
+        ch.out = 0;
+        ch.value = 0;
+        ch.delay = 0;
+        ch.armed = false;
+        ch.load = false;
+        ch.phase = 0;
+        ch.remain = 0;
+    }
+
+    /* levels at PIA/PPI power-up defaults (PC = 0xff, PA2 = 0xff) */
+    this->tapeout_level = 1;
+    this->tapein_level = 0;
+    this->covox_level = 0xff;
+    this->covox_norm = 0.0f;
+}

@@ -1,0 +1,112 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "sound_filters.h"
+
+struct _options
+{
+    std::string bootromfile;
+    std::string romfile;
+    int rom_org;
+    int pc;
+    std::string wavfile;
+    std::vector<std::string> eddfile;
+    int max_frame;
+    bool vsync;
+    bool novideo;
+    int screen_width;
+    int screen_height;
+    int border_width;
+    int center_offset;
+
+    struct _volume {
+        float timer;
+        float beeper;
+        float ay;
+        float covox;
+        float global;
+    } volume;
+
+    struct _enables {
+        bool timer_ch0;
+        bool timer_ch1;
+        bool timer_ch2;
+        bool ay_ch0;
+        bool ay_ch1;
+        bool ay_ch2;
+    } enable;
+
+    bool nofilter;      /* bypass audio filter */
+
+    /* PSP: config.ini options (see config.cpp) */
+    bool show_border;   /* show the complete Vector-06C frame with border */
+    bool show_fps;      /* show the FPS counter in the top-left corner */
+    bool fast_framebuffer; /* build the frame in one pass after the machine
+                              frame instead of the raster-emulating filler */
+    bool sound_record;    /* diagnostic: record the generated sound and the
+                             callback output to psp_internal.wav and
+                             psp_callback.wav (see config.cpp) */
+    int sound_buffer_ms;  /* target ring fill for the playback controller
+                             in milliseconds (default 40, see config.cpp) */
+    SoundMode sound_mode; /* waveform reconstruction kernel of the audio
+                             callback resampler: none/cubic/gaussian/sinc
+                             (default none, see config.cpp) */
+
+    /* PSP thread priorities (hex, user range 0x08..0x77, lower value
+     * = higher priority). worker = emulation thread, main = display
+     * thread; the single CPU goes to the higher-priority runnable
+     * thread, so their balance decides how many frames reach the
+     * screen when the emulation is heavy. */
+    int worker_priority;
+    int main_priority;
+
+    /* Game Center URLs (configurable via config.ini) */
+    std::string catalog_url;
+    std::string download_url;
+
+    bool nosound;
+    bool nofdc;
+    bool bootpalette;
+
+    bool autostart;
+    bool window;        /* run in a window */
+    int blendmode;      /* 0: no blend, 1: mix in doubled frames */
+
+    bool opengl;
+    struct _opengl_opts {
+        /* e.g. myshader for myshader.vsh/fsh for use shader */
+        std::string shader_basename; 
+        bool use_shader;
+        bool default_shader;
+        bool filtering;
+    } gl;
+
+    struct _log {
+        bool fdc;
+        bool audio;
+        bool video;
+    } log;
+
+    bool profile;       /* enable gperftools CPU profiler */
+
+    bool vsync_enable;  /* true if window has mouse focus */
+
+    std::vector<std::string> scriptfiles;
+    std::vector<std::string> scriptargs;
+
+    std::string path_for_frame(int n);
+    std::vector<std::string> fddfile;
+    std::vector<int> save_frames;
+    std::string audio_rec_path;
+
+    void load(const std::string & filename);
+    void save(const std::string & filename);
+    std::string get_config_path(void);
+    void parse_log(const std::string & opt);
+};
+
+extern _options Options;
+
+void options(int argc, char ** argv);
