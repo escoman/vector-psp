@@ -1,5 +1,5 @@
 # PSP build for vector06sdl - Vector-06C emulator
-# Builds EBOOT.PBP, copies result into release/
+# Builds EBOOT.PBP, copies result into release/VECTOR06C/ (ready game package)
 
 VERSION = 1.0.2
 VERSION_INFO = "optimization"
@@ -60,7 +60,7 @@ PSP_EBOOT_ICON = assets/ICON1.PNG
 PSP_EBOOT_PIC1 = assets/PIC1.PNG
 PSP_EBOOT_SND0 = assets/LOGO.AT3
 
-EXTRA_CLEAN = release/EBOOT.PBP gmon.out profile.txt
+EXTRA_CLEAN = release/VECTOR06C/EBOOT.PBP gmon.out profile.txt
 
 include $(PSPSDK)/lib/build.mak
 
@@ -80,10 +80,11 @@ assets/logo_data.o: assets/logo_data.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Правильный Linux-синтаксис для создания папки и копирования
+RELEASE_DIR = release/VECTOR06C
 all: $(TARGET).elf $(EXTRA_TARGETS)
-	@mkdir -p release
-	@cp -f EBOOT.PBP release/EBOOT.PBP
-	@echo "EBOOT.PBP successfully copied to release/"
+	@mkdir -p $(RELEASE_DIR)
+	@cp -f EBOOT.PBP $(RELEASE_DIR)/EBOOT.PBP
+	@echo "EBOOT.PBP successfully copied to $(RELEASE_DIR)/"
 
 # Local deployment targets
 -include deploy.mk

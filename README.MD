@@ -50,13 +50,13 @@ make all
 
 - `v06xpsp.elf` — ELF-бинарник;
 - `EBOOT.PBP` — готовый образ для PSP (title `Vector-06c PSP`);
-- `release/EBOOT.PBP` — копия EBOOT для распространения.
+- `release/VECTOR06C/EBOOT.PBP` — копия EBOOT в готовом пакете для распространения.
 
 Сборка релиза по умолчанию: `DEBUG_ENABLED=0`, оптимизация `-O3`.
 
 ### Установка на PSP / в PPSSPP
 
-Готовый пакет — содержимое папки `release/` — копируется на карту памяти в:
+Готовый пакет — папка `release/VECTOR06C/` — копируется на карту памяти в:
 
 ```
 ms0:/PSP/GAME/VECTOR06C/
@@ -65,6 +65,18 @@ ms0:/PSP/GAME/VECTOR06C/
 ```
 
 В PPSSPP этот путь обычно выглядит как `~/.config/ppsspp/PSP/GAME/VECTOR06C/`.
+
+### Архив для GitHub Releases
+
+Скрипт `utils/make_release.sh` упаковывает `release/VECTOR06C/` в версионированный
+архив `release/VECTOR06C-v<VERSION>.zip` (версия берётся из `VERSION` в Makefile):
+
+```bash
+make all                      # сначала собирать EBOOT.PBP
+utils/make_release.sh         # -> release/VECTOR06C-v1.0.2.zip
+```
+
+Полученный zip прикладывается к релизу на странице `Releases → Draft new release`.
 
 ### Автоматический деплой в PPSSPP
 
@@ -98,8 +110,8 @@ make deploy-profile    # профайлер (-O2 -pg, gmon.out) + деплой
 ├── gui/              # UI на PSP GU: ROM-браузер, главное меню, конфиг, VKBD ...
 ├── boot/boots.bin    # загрузочный ROM (2 КБ), встраивается в boots.c через xxd
 ├── assets/           # иконки/скриншоты EBOOT, логотип (logo_data.c генерируется)
-├── release/          # выходной пакет: EBOOT.PBP + ROMS/
-├── utils/            # утилиты анализа звука/профиля
+├── release/          # выходной пакет: VECTOR06C/ (EBOOT.PBP + ROMS) + zip-архивы релизов
+├── utils/            # утилиты: упаковка релиза, анализ звука/профиля
 └── test/             # host-тесты отдельных модулей
 ```
 

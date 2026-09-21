@@ -7,8 +7,9 @@ tags
 *.elf
 EBOOT.PBP
 PARAM.SFO
-release/EBOOT.PBP
-release/BOOT.PBP
+release/VECTOR06C/EBOOT.PBP
+release/VECTOR06C/BOOT.PBP
+release/*.zip
 assets/logo_data.c
 
 # Sound-mode test artifacts

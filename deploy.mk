@@ -32,9 +32,9 @@ deploy-profile:
 	@$(MAKE) DEPLOY_TYPE=deploy-profile _do_deploy
 
 # Conditional copy to PPSSPP_DIR (shared by all deploy-* targets).
-# Skipped silently when PPSSPP_DIR does not exist or release/EBOOT.PBP was not built.
+# Skipped silently when PPSSPP_DIR does not exist or the release EBOOT was not built.
 _do_deploy:
-	@if [ -d "$(PPSSPP_DIR)" ] && [ -f release/EBOOT.PBP ]; then \
-		cp -f release/EBOOT.PBP $(PPSSPP_DIR)/EBOOT.PBP && \
+	@if [ -d "$(PPSSPP_DIR)" ] && [ -f release/VECTOR06C/EBOOT.PBP ]; then \
+		cp -f release/VECTOR06C/EBOOT.PBP $(PPSSPP_DIR)/EBOOT.PBP && \
 		echo "Deployed $(DEPLOY_TYPE) to $(PPSSPP_DIR)"; \
 	fi
