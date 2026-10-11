@@ -30,8 +30,12 @@
 namespace StateFile
 {
     /* Bumped whenever the serialized Board layout changes; a file
-     * with an unknown version is refused as "Invalid state". */
-    static const int STATE_VERSION = 1;
+     * with an unknown version is refused as "Invalid state".
+     * v2: added the TIMING chunk (live 8253 counters + IO output staging
+     * + timer fractional carry) so raster-synced games survive a
+     * save/restore; v1 files predate it and are rejected rather than
+     * silently restored with a dead frame-sync counter. */
+    static const int STATE_VERSION = 2;
     /* magic[4] + version u32 LE + timestamp u64 LE (unix seconds,
      * the moment of saving; shown in the slot). */
     static const int HEADER_SIZE = 16;

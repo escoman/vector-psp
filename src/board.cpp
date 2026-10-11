@@ -142,6 +142,9 @@ bool Board::check_interrupt()
         const int rst7_cycles = i8080_execute(0xff); // rst7
         this->total_v_cycles += rst7_cycles;
         this->instr_time += rst7_cycles;
+        /* The RST7 T-states fold into instr_time and are counted by the
+         * next single_step()'s instr_time/2 timer tick (see single_step),
+         * exactly like the reference core - no separate advance here. */
 
         return true;
     }
@@ -334,6 +337,14 @@ void Board::single_step(bool update_screen)
     if (this->frame_no > 60) {
         this->tape_player.advance(this->instr_time);
     }
+    /* Drive the guest-visible КР580ВИ53 from the SAME instr_time that moves
+     * the raster beam, at the SAME integer rate the reference core uses in
+     * soundSteps(instr_time/2). Locking the counter to instr_time (not to
+     * the raw instruction T-states) keeps Exolon's IN 0x0A frame-sync wrap
+     * at a fixed beam position; an accumulator on v_cycles decoupled the
+     * two and shredded the picture. Sound is unaffected: it runs off
+     * Soundnik's separate timer_ch[] mirror. */
+    this->io.tick_timer(this->instr_time / 2);
     /* Event-based sound: only advance the sound clock here. Chip writes
      * are queued as events by IO and rendered in batch at frame end. */
     this->soundnik.advance_clock(this->instr_time / 2);
@@ -793,6 +804,7 @@ void Board::serialize(std::vector<uint8_t>& to)
     this->io.serialize(to);
     i8080cpu::serialize(to);
     this->serialize_self(to);
+    this->serialize_timing(to);
     this->debug.serialize(to);
 }
 
@@ -828,6 +840,45 @@ void Board::deserialize_self(
     from += total_v_cycles_sizeof;
 }
 
+void Board::serialize_timing(SerializeChunk::stype_t& to) const
+{
+    SerializeChunk::stype_t chunk;
+    /* Live КР580ВИ53 counters first (control word + 3 CounterUnits). */
+    this->io.timer_ref().dump(chunk);
+
+    int op, ob, pb;
+    this->io.save_staging(op, ob, pb);
+    auto push32 = [&chunk](int32_t v) {
+        chunk.push_back((uint8_t)(v & 0xff));
+        chunk.push_back((uint8_t)((v >> 8) & 0xff));
+        chunk.push_back((uint8_t)((v >> 16) & 0xff));
+        chunk.push_back((uint8_t)((v >> 24) & 0xff));
+    };
+    push32(op);
+    push32(ob);
+    push32(pb);
+
+    SerializeChunk::insert_chunk(to, SerializeChunk::TIMING, chunk);
+}
+
+void Board::deserialize_timing(
+  SerializeChunk::stype_t::iterator from, uint32_t size)
+{
+    (void)size;
+    this->io.timer_ref().undump(from);
+
+    auto pop32 = [&from]() -> int32_t {
+        int32_t v = (int32_t)((uint8_t)from[0] | ((uint8_t)from[1] << 8) |
+            ((uint8_t)from[2] << 16) | ((uint32_t)(uint8_t)from[3] << 24));
+        from += 4;
+        return v;
+    };
+    int op = pop32();
+    int ob = pop32();
+    int pb = pop32();
+    this->io.restore_staging(op, ob, pb);
+}
+
 bool Board::deserialize(std::vector<uint8_t>& from)
 {
     auto it = from.begin();
@@ -850,6 +901,9 @@ bool Board::deserialize(std::vector<uint8_t>& from)
                     break;
                 case SerializeChunk::BOARD:
                     this->deserialize_self(begin, size);
+                    break;
+                case SerializeChunk::TIMING:
+                    this->deserialize_timing(begin, size);
                     break;
                 case SerializeChunk::DEBUG:
                     this->debug.deserialize(begin, size);

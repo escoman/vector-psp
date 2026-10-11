@@ -1,6 +1,7 @@
 #pragma once
 
 #include <inttypes.h>
+#include <vector>
 
 #define WRITE_DELAY 2
 #define LATCH_DELAY 1
@@ -34,7 +35,13 @@ class CounterUnit
     int delay;
 
 public:
-    CounterUnit() : latch_value(-1), write_state(0), value(0), mode_int(0),
+    /* Full deterministic init: latch_mode/out/write_lsb/write_msb were
+     * left indeterminate, so a freshly reset chip (and every restore,
+     * which resets first) started with garbage in write_value() and
+     * read_value() - which then mis-handled the lsb/msb staging of the
+     * frame-sync counter games like Exolon rely on. */
+    CounterUnit() : latch_value(-1), write_state(0), latch_mode(0), out(0),
+        value(0), mode_int(0), write_lsb(0), write_msb(0),
         loadvalue(0), flags(0), delay(0)
     {
 
@@ -89,7 +96,7 @@ public:
 
     int Count(int incycles) 
     {
-        int cycles = 1; //incycles;
+        int cycles = incycles;
         if (this->delay) {
             --this->delay;
             cycles = 0;
@@ -304,6 +311,60 @@ public:
         }
         return value;
     }
+
+    /* Save/restore the full counter so a snapshot can carry the live
+     * countdown. Each field is written as a fixed 32-bit little-endian
+     * word so the stream is independent of host int width. Named dump/
+     * undump because `load` is already a counter flag (union bitfield). */
+    void dump(std::vector<uint8_t> & to) const
+    {
+        auto push32 = [&to](int32_t v) {
+            to.push_back((uint8_t)(v & 0xff));
+            to.push_back((uint8_t)((v >> 8) & 0xff));
+            to.push_back((uint8_t)((v >> 16) & 0xff));
+            to.push_back((uint8_t)((v >> 24) & 0xff));
+        };
+        push32(latch_value);
+        push32(write_state);
+        push32(latch_mode);
+        push32(out);
+        push32(value);
+        push32(mode_int);
+        push32((int32_t)write_lsb);
+        push32((int32_t)write_msb);
+        push32((int32_t)loadvalue);
+        push32((int32_t)flags);
+        push32(delay);
+    }
+
+    void undump(std::vector<uint8_t>::iterator & it)
+    {
+        auto pop32 = [&it]() -> int32_t {
+            int32_t v = (int32_t)((uint8_t)it[0] | ((uint8_t)it[1] << 8) |
+                ((uint8_t)it[2] << 16) | ((uint32_t)(uint8_t)it[3] << 24));
+            it += 4;
+            return v;
+        };
+        latch_value = pop32();
+        write_state = pop32();
+        latch_mode = pop32();
+        out = pop32();
+        value = pop32();
+        mode_int = pop32();
+        write_lsb = (uint8_t)pop32();
+        write_msb = (uint8_t)pop32();
+        loadvalue = (uint16_t)pop32();
+        flags = (uint32_t)pop32();
+        delay = pop32();
+    }
+
+    /* Read-only peek for diagnostics; no side effects (see I8253::
+     * counter_value et al.). */
+    int peek_value() const { return this->value; }
+    int peek_loadvalue() const { return this->loadvalue; }
+    int peek_enabled() const { return this->enabled ? 1 : 0; }
+    int peek_mode() const { return this->mode_int; }
+    int peek_write_state() const { return this->write_state; }
 };
 
 
@@ -376,6 +437,40 @@ public:
         counters[1] = CounterUnit();
         counters[2] = CounterUnit();
     }
+
+    /* Advance all counters by n single clocks. The emulation loop calls
+     * this once per CPU instruction with the instruction's T-states / 2
+     * (one КР580ВИ53 clock = 2 i8080 T-states = 8 of the 12 MHz v_cycles;
+     * a 59904-T-state frame is therefore exactly 29952 clocks). Stepping
+     * one clock at a time keeps CounterUnit's write/latch `delay` semantics
+     * honest, which a single Count(n) would collapse. */
+    void tick(int n)
+    {
+        while (n-- > 0) this->Count(1);
+    }
+
+    void dump(std::vector<uint8_t> & to) const
+    {
+        to.push_back(control_word);
+        for (unsigned i = 0; i < sizeof(counters)/sizeof(counters[0]); ++i)
+            counters[i].dump(to);
+    }
+
+    void undump(std::vector<uint8_t>::iterator & it)
+    {
+        control_word = (uint8_t)*it++;
+        for (unsigned i = 0; i < sizeof(counters)/sizeof(counters[0]); ++i)
+            counters[i].undump(it);
+    }
+
+    /* Read-only peek accessors for diagnostics (save/restore self-tests,
+     * debugger). They have no side effects, unlike read()/read_value()
+     * which advances the lsb/msb staging. */
+    int counter_value(int n) const { return counters[n].peek_value(); }
+    int counter_loadvalue(int n) const { return counters[n].peek_loadvalue(); }
+    int counter_enabled(int n) const { return counters[n].peek_enabled(); }
+    int counter_mode(int n) const { return counters[n].peek_mode(); }
+    int counter_write_state(int n) const { return counters[n].peek_write_state(); }
 };
 
 class TimerWrapper

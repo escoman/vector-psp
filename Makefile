@@ -1,8 +1,8 @@
 # PSP build for vector06sdl - Vector-06C emulator
 # Builds EBOOT.PBP, copies result into release/VECTOR06C/ (ready game package)
 
-VERSION = 1.0.2
-VERSION_INFO = "optimization"
+VERSION = 1.0.3
+VERSION_INFO = "fix timer"
 
 TARGET = v06xpsp
 OBJS = src/main.o src/debuglog.o src/config.o src/filelist.o src/imgload.o \

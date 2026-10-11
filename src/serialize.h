@@ -13,6 +13,12 @@ public:
         CPU = 0xfeca0000,
         BOARD = 0xfecababe,
         DEBUG = 0xfefadada,
+        /* Live КР580ВИ53 counter state + the in-flight IO output staging
+         * registers. Without this a save/restore wipes the frame-sync
+         * counter games like Exolon wait on (they program it once at boot
+         * and never rewrite it), so every IN 0x08..0x0B reads a frozen 0 and
+         * the raster schedule free-runs = the post-restore flicker. */
+        TIMING = 0xfeca5853,
     };
 
     static void insert_chunk(stype_t &to, id chunk_id, stype_t &chunk)

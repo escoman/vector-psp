@@ -129,6 +129,39 @@ public:
         yellowblue();
     }
 
+    /* Advance the guest-visible КР580ВИ53 by `ticks` clocks. Called from
+     * Board::single_step() once per instruction with the T-states/2 the
+     * instruction consumed, so IN 0x08..0x0B returns a live countdown.
+     * This is separate from Soundnik's timer_ch[] mirror (audio), which
+     * the same register writes feed through sound_event; the two are
+     * intentionally independent, only this one answers guest reads. */
+    void tick_timer(int ticks)
+    {
+        this->timer.tick(ticks);
+    }
+
+    /* Accessors for the save-state TIMING chunk (see SerializeChunk::TIMING
+     * and Board::serialize_timing). The timer object lives outside IO (it is
+     * shared with TimerWrapper/Soundnik); IO only borrows it by reference, so
+     * Board reaches it through here to snapshot the live countdown. The
+     * staging getters/setters expose the OUT-in-flight registers that are
+     * otherwise private to output()/commit(). */
+    I8253 & timer_ref() { return this->timer; }
+
+    void save_staging(int & op, int & ob, int & pb) const
+    {
+        op = this->outport;
+        ob = this->outbyte;
+        pb = this->palettebyte;
+    }
+
+    void restore_staging(int op, int ob, int pb)
+    {
+        this->outport = op;
+        this->outbyte = ob;
+        this->palettebyte = pb;
+    }
+
     int input(int port)
     {
         int result = 0xff;

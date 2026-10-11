@@ -428,12 +428,16 @@ void Emulator::save_state(vector <uint8_t> &to) {
     this->board.serialize(to);
 }
 
-/* The state file carries only memory, CPU and the visible IO part;
- * the sound chips (8253, AY) and the Soundnik mirrors/event queue
- * stay out of it. Reset the whole machine through the same path a
+/* The state file carries memory, CPU, the visible IO part and — since the
+ * TIMING chunk — the live КР580ВИ53 counter state (see SerializeChunk::TIMING
+ * and Board::serialize_timing); the AY chip and the Soundnik mirrors/event
+ * queue still stay out of it. Reset the whole machine through the same path a
  * ROM load uses before applying the snapshot, so no pre-load
  * register contents survive — without this, a note playing at the
- * load moment drones on forever after the restore. */
+ * load moment drones on forever after the restore. The reset wipes the
+ * 8253, so the TIMING chunk must be deserialized afterwards to bring the
+ * frame-sync counters back; games that program the timer once at boot and
+ * poll it for sync (Exolon) would otherwise read a frozen 0 forever. */
 static bool state_chunks_valid(std::vector<uint8_t> & data)
 {
     auto it = data.begin();
@@ -448,6 +452,7 @@ static bool state_chunks_valid(std::vector<uint8_t> & data)
             case SerializeChunk::IO:
             case SerializeChunk::CPU:
             case SerializeChunk::BOARD:
+            case SerializeChunk::TIMING:
             case SerializeChunk::DEBUG:
                 break;
             default:

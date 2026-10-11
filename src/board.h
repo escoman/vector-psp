@@ -162,6 +162,13 @@ class Board
     void serialize_self(SerializeChunk::stype_t& to) const;
     void deserialize_self(
       SerializeChunk::stype_t::iterator from, uint32_t size);
+    /* TIMING chunk: live 8253 counters + IO output staging registers. Saved
+     * /restored at frame boundaries (the UI only reaches save/restore while
+     * the worker is paused), so carrying the counter value is enough to keep
+     * CPU<->raster phase. */
+    void serialize_timing(SerializeChunk::stype_t& to) const;
+    void deserialize_timing(
+      SerializeChunk::stype_t::iterator from, uint32_t size);
 
     void set_bootrom(const std::vector<uint8_t>& bootbytes);
 
