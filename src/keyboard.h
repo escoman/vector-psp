@@ -15,15 +15,46 @@ private:
     uint8_t matrix[8];
     std::map<int, uint32_t> keymap;
 
+    /* РУС/ЛАТ level semantics:
+     * - Physical PSP button: keydown → rus=true, keyup → rus=false.
+     *   Works fine: the two events land in different worker frames.
+     * - VKBD X-tap: keydown AND keyup arrive in the SAME frame (both
+     *   drained before CPU runs). ROM never sees rus=true.
+     * Fix: guarantee rus=true stays visible for at least
+     * RUS_HOLD_FRAMES machine frames. If keyup arrives while the
+     * hold is running, defer the release until hold expires. If the
+     * user holds longer than RUS_HOLD_FRAMES, keyup releases rus
+     * immediately (normal level behavior). */
+    int rus_hold_frames;
+    bool rus_keyup_pending;
+
 public:
     bool ss, us, rus;
     bool terminate;
     std::function<void(bool)> onreset;
 
-    Keyboard() : ss(false), us(false), rus(false), terminate(false)
+    /* Minimum number of machine frames rus=true must be visible to
+     * the ROM for it to latch the lamp (50 Hz → ~160 ms). */
+    static const int RUS_HOLD_FRAMES = 8;
+
+    Keyboard() : rus_hold_frames(0), rus_keyup_pending(false),
+                 ss(false), us(false), rus(false), terminate(false)
     {
         memset(matrix, 0, sizeof(matrix));
         init_map();
+    }
+
+    /* Called once per machine frame by Board::execute_frame before
+     * the CPU runs. Handles the deferred keyup. */
+    void tick()
+    {
+        if (this->rus_hold_frames > 0) {
+            --this->rus_hold_frames;
+            if (this->rus_hold_frames == 0 && this->rus_keyup_pending) {
+                this->rus = false;
+                this->rus_keyup_pending = false;
+            }
+        }
     }
 
     bool key_down(SDL_KeyboardEvent e)
@@ -71,11 +102,24 @@ public:
                 break; // ctrl/us
             case SDL_SCANCODE_LGUI:
             case SDL_SCANCODE_F6: // РУС/ЛАТ scancode on the PSP port
-                /* РУС/ЛАТ is a momentary key: the ROM samples its
-                 * level (PC port upper, bit 7 input) and toggles the
-                 * input mode and the lamp latch itself on every
-                 * press. Must stay a level, not a latch. */
-                this->rus = !keyup;
+                /* Level semantics (rus=true while held) with a
+                 * minimum-hold guarantee: VKBD tap sends keydown
+                 * and keyup in the same frame; the hold ensures
+                 * the ROM sees bit7=0 for several consecutive scan
+                 * cycles so the lamp latches. Physical key held
+                 * longer than RUS_HOLD_FRAMES: keyup releases
+                 * immediately. */
+                if (!keyup) {
+                    this->rus = true;
+                    this->rus_hold_frames = RUS_HOLD_FRAMES;
+                    this->rus_keyup_pending = false;
+                } else {
+                    if (this->rus_hold_frames > 0) {
+                        this->rus_keyup_pending = true;
+                    } else {
+                        this->rus = false;
+                    }
+                }
                 break; // cmd/rus
                 // matrix keys
             default:
@@ -164,7 +208,8 @@ private:
                 SDL_SCANCODE_C,             0x408,
                 SDL_SCANCODE_B,             0x404,
                 SDL_SCANCODE_A,             0x402,
-                SDL_SCANCODE_MINUS,         0x401, // 189:-@
+                SDL_SCANCODE_MINUS,         0x320, // '-/=' (row3 bit5, same cell as EQUALS; SS distinguishes)
+                SC_AT,                      0x401, // 'Ю/@' synthetic keycap (row4 bit0)
 
                 SDL_SCANCODE_SLASH,         0x380,
                 SDL_SCANCODE_PERIOD,        0x340,

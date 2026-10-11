@@ -45,6 +45,7 @@ static const key_entry_t key_registry[] = {
     { SDL_SCANCODE_END,           "END",      "END"       },
     { SDL_SCANCODE_MINUS,         "MINUS",    "MINUS"     },
     { SDL_SCANCODE_EQUALS,        "EQUALS",   "EQUALS"    },
+    { SC_AT,                      "AT",       "AT (Ю)"    },
     { SDL_SCANCODE_SLASH,         "SLASH",    "SLASH"     },
     { SDL_SCANCODE_BACKSLASH,     "BSLASH",   "BSLASH"    },
     { SDL_SCANCODE_COMMA,         "COMMA",    "COMMA"     },

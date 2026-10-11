@@ -90,6 +90,12 @@ enum {
      * maps them to (HOME ~ ^\, END ~ СТР) */
     SDL_SCANCODE_HOME = 0xa0,
     SDL_SCANCODE_END = 0xa1,
+
+    /* Synthetic scancode for the Vector 'Ю/@' keycap at matrix row4
+     * bit0. It is a real Vector key with no PC physical equivalent;
+     * VKBD sends it and the user can bind a PSP button to it in
+     * the Map Keys window. */
+    SC_AT = 0xa2,
 };
 
 enum SDL_PixelFormat {

@@ -164,6 +164,12 @@ int Board::execute_frame(bool update_screen)
     if (this->debugger_interrupt || this->script_interrupt)
         return 0;
 
+    /* РУС/ЛАТ minimum-hold counter: advance one machine frame.
+     * Guarantees the ROM keyboard scan sees bit7 for at least
+     * RUS_HOLD_FRAMES frames even when VKBD keydown+keyup arrive
+     * in the same Emulator::execute_frame drain cycle. */
+    this->io.the_keyboard().tick();
+
     ++this->frame_no;
     this->filler.reset();
     this->irq_carry = false; // imitates cpu waiting after T2 when INTE

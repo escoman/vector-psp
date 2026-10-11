@@ -387,16 +387,20 @@ void VirtualKeyboard::make_key_info(key_info_t & ki, int col, int row,
     for (unsigned i = 0; i < sizeof(longKeys)/sizeof(longKeys[0]); ++i) {
         if (longKeys[i] == ki.coord) {
             unit_width = unit_width_t::U1_5;
-            ki.color = C_KEY_BROWN;
-            ki.text_color = C_KEY_TEXT_BROWN;
         }
     }
     if (ki.coord == spaceKey) {
         unit_width = unit_width_t::U7;
         ki.color = C_KEY_GREEN;
     }
-    for (unsigned i = 0; i < sizeof(greenishKeys)/sizeof(greenishKeys[0]); ++i) {
-        if (greenishKeys[i] == ki.coord) ki.color = C_KEY_GREEN;
+    for (unsigned i = 0; i < sizeof(oliveKeys)/sizeof(oliveKeys[0]); ++i) {
+        if (oliveKeys[i] == ki.coord) ki.color = C_KEY_GREEN;
+    }
+    for (unsigned i = 0; i < sizeof(brownKeys)/sizeof(brownKeys[0]); ++i) {
+        if (brownKeys[i] == ki.coord) {
+            ki.color = C_KEY_BROWN;
+            ki.text_color = C_KEY_TEXT_BROWN;
+        }
     }
     for (unsigned i = 0; i < sizeof(mustardKeys)/sizeof(mustardKeys[0]); ++i) {
         if (mustardKeys[i] == ki.coord) ki.color = C_KEY_FN;
@@ -644,16 +648,16 @@ void VirtualKeyboard::paint()
 const char * const VirtualKeyboard::top_text[] = {
     "; 1 2 3 4 5 6 7 8 9 0 - /",
     "Й Ц У К Е Н Г Ш Щ З Х :",
-    "УС Ф Ы В А П Р О Л Д Ж Э .",
-    "СС Я Ч С М И Т Ь Б Ю , ВК",
+    "УС Ф Ы В А П Р О Л Д Ж Э >",
+    "СС Я Ч С М И Т Ь Б Ю < ВК",
     "РУС ТАБ ___ ПС ЗБ"};
 
 const char * const VirtualKeyboard::bottom_text[] = {
-    "+ ! \" # ¤ % & ' ( ) ___ = ?",
-    "J C U K E N G [ ] Z H *",
-    "___ F Y W A P R O L D V \\ >",
-    "___ Q ^ S M I T X B @ < ___",
-    "LAT ___ ___ ___ _"};
+    "+ ! \" # $ % ^ & * ( ) = ?",
+    "J C U K E N G [ ] Z H '",
+    "___ F Y W A P R O L D V \\ .",
+    "___ Q ^ S M I T X B @ , ___",
+    "___ ___ ___ ___ ___"};
 
 const char * const VirtualKeyboard::num_text[] = {
     "ВВОД БЛК СБР",
@@ -663,11 +667,13 @@ const char * const VirtualKeyboard::num_text[] = {
     "← ↓ →"};
 
 const int VirtualKeyboard::longKeys[] =
-    {300, 311, 400, 401, 403, 404}; /* also brown */
-const int VirtualKeyboard::greenishKeys[] =
-    {402, 50, 51, 52, 252, 200};
+    {300, 311, 400, 401, 403, 404};
+const int VirtualKeyboard::oliveKeys[] =
+    {200, 300, 311, 400, 401, 403, 404};
+const int VirtualKeyboard::brownKeys[] =
+    {50, 51, 52};
 const int VirtualKeyboard::mustardKeys[] =
-    {150, 151, 152, 250, 251, 352};
+    {150, 151, 152, 250, 251, 252};
 const int VirtualKeyboard::spaceKey = 402;
 
 const int VirtualKeyboard::scancodes[5][14] = {
@@ -688,7 +694,7 @@ const int VirtualKeyboard::scancodes[5][14] = {
 
     {SDL_SCANCODE_LSHIFT, SDL_SCANCODE_Q, SDL_SCANCODE_GRAVE, SDL_SCANCODE_S,
         SDL_SCANCODE_M, SDL_SCANCODE_I, SDL_SCANCODE_T, SDL_SCANCODE_X,
-        SDL_SCANCODE_B, SDL_SCANCODE_MINUS, SDL_SCANCODE_COMMA,
+        SDL_SCANCODE_B, SC_AT, SDL_SCANCODE_COMMA,
         SDL_SCANCODE_RETURN},
 
     {SDL_SCANCODE_F6, SDL_SCANCODE_TAB,
@@ -699,7 +705,7 @@ const int VirtualKeyboard::scancodes_num[5][3] = {
     {SDL_SCANCODE_F11, -1, SDL_SCANCODE_F12},
     {SDL_SCANCODE_F1, SDL_SCANCODE_F2, SDL_SCANCODE_F3},
     {SDL_SCANCODE_F4, SDL_SCANCODE_F5, SDL_SCANCODE_ESCAPE},
-    {SDL_SCANCODE_HOME, SDL_SCANCODE_UP, SDL_SCANCODE_END},
+    {SDL_SCANCODE_F7, SDL_SCANCODE_UP, SDL_SCANCODE_F8},
     {SDL_SCANCODE_LEFT, SDL_SCANCODE_DOWN, SDL_SCANCODE_RIGHT}};
 
 void VirtualKeyboard::draw()

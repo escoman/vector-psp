@@ -228,8 +228,13 @@ private:
     static const char * const top_text[];
     static const char * const bottom_text[];
     static const char * const num_text[];
-    static const int longKeys[6];     /* also brown */
-    static const int greenishKeys[6];
+    /* longKeys: 1.5u wide keys (CC, BK, RUS, TAB, PS, ZB) — width only. */
+    static const int longKeys[6];
+    /* oliveKeys: GREEN color group (CC, BK, RUS, TAB, PS, ZB, US). */
+    static const int oliveKeys[7];
+    /* brownKeys: vvod / blk / sbr system caps (BROWN). */
+    static const int brownKeys[3];
+    /* mustardKeys: F1..F5 + AR2 (FN/gold). STR and arrows are ALPHA. */
     static const int mustardKeys[6];
     static const int spaceKey;
     static const int scancodes[5][14];
