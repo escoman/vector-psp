@@ -26,9 +26,17 @@ deploy-autoselect:
 	@$(MAKE) DEPLOY_TYPE=deploy-autoselect _do_deploy
 
 ## deploy-profile: profiler build (PROFILE=1, DEBUG_ENABLED=0, CORE_DEBUG=0, -O2, -pg) + deploy
+#
+# AUTOSELECT_ROM is not optional here: both gprof_stop("gmon.out") and the
+# 60 s auto-stop that flushes it live inside #ifdef AUTOSELECT_ROM in
+# main.cpp, so without the flag the build runs forever and writes no
+# profile at all. Note that the fixed wait in utils/run_60sec_kill is too
+# short for this build - PPSSPP startup eats part of it and the run stops
+# before the 60 s mark. Run it as:
+#   RUN_SECONDS=100 ./utils/run_60sec_kill
 deploy-profile:
 	@$(MAKE) clean
-	@$(MAKE) PROFILE=1 DEBUG_ENABLED=0 CORE_DEBUG=0
+	@$(MAKE) PROFILE=1 DEBUG_ENABLED=0 CORE_DEBUG=0 EXTRA_DEFS=-DAUTOSELECT_ROM
 	@$(MAKE) DEPLOY_TYPE=deploy-profile _do_deploy
 
 # Conditional copy to PPSSPP_DIR (shared by all deploy-* targets).

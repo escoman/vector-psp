@@ -30,13 +30,19 @@ class Board
 
 #ifdef AUTOSELECT_ROM
     /* Perf instrumentation (test builds only): microseconds accumulated
-     * since the previous perf.log line. */
+     * since the previous perf.log line.
+     * exec/snd/render/fastfb/frames are measured exactly around their
+     * calls. cpu/fill are indicative only: a single step is shorter
+     * than the 1 us clock resolution, so they are estimated as a ratio
+     * over a block of steps and normalised onto the measured span
+     * (their sum cannot exceed exec). Use a PROFILE=1 build and
+     * psp-gprof to attribute time inside the step. */
     unsigned perf_exec_us = 0;   /* single-step loop (cpu + filler) */
-    unsigned perf_snd_us = 0;    /* soundnik.process_frame */
-    unsigned perf_render_us = 0; /* TV::render */
-    unsigned perf_cpu_us = 0;    /* i8080_instruction, sampled x32 */
-    unsigned perf_fill_us = 0;   /* filler.fill, sampled x32 */
-    unsigned perf_fastfb_us = 0; /* filler.render_full_frame (fast mode) */
+    unsigned perf_snd_us = 0;    /* soundnik.process_frame (exact) */
+    unsigned perf_render_us = 0; /* TV::render (exact) */
+    unsigned perf_cpu_us = 0;    /* i8080_instruction, block-normalized */
+    unsigned perf_fill_us = 0;   /* filler.fill, block-normalized */
+    unsigned perf_fastfb_us = 0; /* filler.render_full_frame (exact, fast mode) */
     unsigned perf_frames = 0;    /* machine frames executed */
 #endif
 

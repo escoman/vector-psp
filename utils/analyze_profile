@@ -1,14 +1,54 @@
 #!/bin/bash
+#
+# analyze_profile - run psp-gprof over the gmon.out of a PROFILE build.
+#
+# Usage: utils/analyze_profile [gmon.out] [profile.txt]
+#   Both arguments are optional. With no arguments the input is resolved
+#   automatically: ./gmon.out if present (a copy moved out of the game
+#   directory), otherwise <game dir>/gmon.out left there by
+#   utils/run_60sec_kill. The output is written next to the input, NOT to
+#   the repo root: Makefile's EXTRA_CLEAN deletes ./gmon.out and
+#   ./profile.txt on every `make clean`, which would throw away the
+#   analysis together with the data it came from.
+#
+# Requires a PROFILE=1 build (see `make deploy-profile`) that actually
+# reached its 60 s auto-stop; run it with RUN_SECONDS=100 so it does.
 
-# analyze_profile - analyze gprof data from a PROFILE build.
-#
-# Usage: psp/utils/analyze_profile
-#   Run from the psp/ directory after a PROFILE build has been executed
-#   via run_60sec_kill (which produces gmon.out in the game directory).
-#
-# Results:
-#   profile.txt - gprof flat profile and call graph
+set -u
 
 cd "$(dirname "$0")/.."
-psp-gprof -b v06xpsp.elf gmon.out > profile.txt
-echo "Profile analysis written to profile.txt"
+
+GD="$HOME/snap/ppsspp-emu/common/.config/ppsspp/PSP/GAME/VECTOR06C"
+
+IN="${1:-}"
+if [ -z "$IN" ]; then
+    if [ -f ./gmon.out ]; then
+        IN=./gmon.out
+    elif [ -f "$GD/gmon.out" ]; then
+        IN="$GD/gmon.out"
+    fi
+fi
+
+if [ -z "$IN" ] || [ ! -f "$IN" ]; then
+    echo "analyze_profile: no gmon.out found." >&2
+    echo "  looked in ./gmon.out and $GD/gmon.out" >&2
+    echo "  Did you run a PROFILE build to completion?" >&2
+    echo "  Try: make deploy-profile && RUN_SECONDS=100 ./utils/run_60sec_kill" >&2
+    exit 1
+fi
+
+if ! command -v psp-gprof >/dev/null 2>&1; then
+    echo "analyze_profile: psp-gprof not in PATH - activate the PSPSDK first." >&2
+    exit 1
+fi
+
+if [ ! -f ./v06xpsp.elf ]; then
+    echo "analyze_profile: ./v06xpsp.elf missing - gprof needs the ELF" >&2
+    echo "  that produced the profile (same build, before `make clean`)." >&2
+    exit 1
+fi
+
+OUT="${2:-$(dirname "$IN")/profile.txt}"
+
+psp-gprof -b v06xpsp.elf "$IN" > "$OUT"
+echo "analyze_profile: $IN -> $OUT"

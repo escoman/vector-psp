@@ -16,10 +16,11 @@
  *                                   psp_callback.wav)
  *   sound_buffer_ms  = 1..150       target ring fill for the playback
  *                                   controller in ms (default 40)
- *   sound_mode       = none|cubic|gaussian|sinc
- *                                   waveform reconstruction kernel of
- *                                   the audio callback resampler
- *                                   (default none, case-insensitive)
+ *   sound_engine     = off|old|new  sound pipeline: off = no audio
+ *                                   generation at all, old = the reference
+ *                                   kernel's per-clock path (box decimated),
+ *                                   new = the event-queue block path
+ *                                   (default new)
  *   worker_priority  = 0x08..0x77   emulation thread priority (hex)
  *   main_priority    = 0x08..0x77   display thread priority (hex)
  *

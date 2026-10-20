@@ -22,6 +22,10 @@ _options Options =
     .enable = {/* timer ch0..2 */ true, true, true,
                /* ay ch0..2 */    true, true, true},
     .nofilter = false,
+
+    /* Default is the block (optimized) pipeline - the engine switch is
+     * set from config.ini (see config.cpp). */
+    .sound_engine = SoundEngine::New,
 };
 
 void options(int argc, char ** argv)
@@ -30,7 +34,6 @@ void options(int argc, char ** argv)
     Options.gl.use_shader = false;
     Options.gl.default_shader = false;
     Options.gl.filtering = false;
-    Options.nosound = false;
     Options.nofdc = false;
     Options.bootpalette = true;
     Options.novideo = false;  /* PSP GU rendering is enabled */

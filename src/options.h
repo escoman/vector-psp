@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "sound_filters.h"
+#include "sound_engine.h"
 
 struct _options
 {
@@ -50,9 +50,10 @@ struct _options
                              psp_callback.wav (see config.cpp) */
     int sound_buffer_ms;  /* target ring fill for the playback controller
                              in milliseconds (default 40, see config.cpp) */
-    SoundMode sound_mode; /* waveform reconstruction kernel of the audio
-                             callback resampler: none/cubic/gaussian/sinc
-                             (default none, see config.cpp) */
+    SoundEngine sound_engine; /* which sound pipeline runs: off / original
+                             (the reference kernel's per-clock path, box
+                             decimated) / optimized (the event-queue block
+                             path) (see config.cpp) */
 
     /* PSP thread priorities (hex, user range 0x08..0x77, lower value
      * = higher priority). worker = emulation thread, main = display
@@ -66,7 +67,8 @@ struct _options
     std::string catalog_url;
     std::string download_url;
 
-    bool nosound;
+    /* nosound from the reference kernel is replaced by
+     * sound_engine = Off; nothing reads the legacy flag any more. */
     bool nofdc;
     bool bootpalette;
 

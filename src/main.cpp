@@ -67,10 +67,13 @@ static std::string statusMessage;
  * VKBD LED. */
 static bool vector_ruslat = false;
 
-/* Sound Mode list values, exactly as spelled in config.ini and as
- * implemented by sound_filters (SoundMode enum order). */
-static const char * const SOUND_MODE_VALUES[] = {
-    "none", "cubic", "gaussian", "sinc",
+/* Sound Engine list values, exactly as spelled in config.ini and in
+ * the same order as the SoundEngine enum (off / original / optimized).
+ * The legacy tokens "old" / "new" are still accepted when parsing
+ * config.ini (see engine_from_name), but the settings UI shows the
+ * descriptive names. */
+static const char * const SOUND_ENGINE_VALUES[] = {
+    "off", "original", "optimized",
 };
 
 /* The Config window edits main_priority from the worker thread, but
@@ -1091,16 +1094,18 @@ int main(int argc, char *argv[])
           },
           nullptr, 0, 1, 150, 1, false },
 
-        { "Sound Mode", "sound_mode", CfgType::LIST,
-          []() { return (int)Options.sound_mode; },
+        { "Sound Engine", "sound_engine", CfgType::LIST,
+          []() { return (int)Options.sound_engine; },
           [soundnik](int v) {
-              Options.sound_mode = (SoundMode)v;
-              /* the resampler picks this enum on the next audio
-               * callback; tables for every mode are prebuilt */
-              soundnik->set_sound_mode((SoundMode)v);
+              Options.sound_engine = (SoundEngine)v;
+              /* re-align both engines' clocks to the current sound
+               * clock and (re)init the audio output: the block and old
+               * paths keep independent cursors, and off->on needs the
+               * PSP audio channel brought up. */
+              soundnik->apply_engine();
           },
-          SOUND_MODE_VALUES,
-          (int)(sizeof(SOUND_MODE_VALUES) / sizeof(SOUND_MODE_VALUES[0])),
+          SOUND_ENGINE_VALUES,
+          (int)(sizeof(SOUND_ENGINE_VALUES) / sizeof(SOUND_ENGINE_VALUES[0])),
           0, 0, 1, false },
 
         { "Worker Priority", "worker_priority", CfgType::INTEGER,
@@ -1225,7 +1230,8 @@ int main(int argc, char *argv[])
      * game folder on the memory stick / under PPSSPP). */
     WavRecorder* rec_internal = nullptr;
     WavRecorder* rec_callback = nullptr;
-    if (Options.sound_record && !Options.nosound) {
+    if (Options.sound_record
+            && Options.sound_engine != SoundEngine::Off) {
         rec_internal = new WavRecorder();
         rec_internal->init("psp_internal.wav");
         rec_callback = new WavRecorder();
@@ -1380,14 +1386,18 @@ int main(int argc, char *argv[])
                         tv->perf_flush_us / 1000, tv->perf_flush_us % 1000);
                     fprintf(pf,
                         "SND  ev=%u.%03u tmr=%u.%03u ay=%u.%03u mix=%u.%03u "
+                        "chip=%u.%03u fir=%u.%03u "
                         "samples=%u aysteps=%u\n",
                         board->snd_perf().perf_ev_us / 1000, board->snd_perf().perf_ev_us % 1000,
                         board->snd_perf().perf_tmr_us / 1000, board->snd_perf().perf_tmr_us % 1000,
                         board->snd_perf().perf_ay_us / 1000, board->snd_perf().perf_ay_us % 1000,
                         board->snd_perf().perf_mix_us / 1000, board->snd_perf().perf_mix_us % 1000,
+                        board->snd_perf().perf_ay_chip_us / 1000, board->snd_perf().perf_ay_chip_us % 1000,
+                        board->snd_perf().perf_ay_fir_us / 1000, board->snd_perf().perf_ay_fir_us % 1000,
                         board->snd_perf().perf_nsamples, board->snd_perf().perf_naysteps);
                     board->snd_perf().perf_ev_us = board->snd_perf().perf_tmr_us = 0;
                     board->snd_perf().perf_ay_us = board->snd_perf().perf_mix_us = 0;
+                    board->snd_perf().perf_ay_chip_us = board->snd_perf().perf_ay_fir_us = 0;
                     board->snd_perf().perf_nsamples = board->snd_perf().perf_naysteps = 0;
                     tv->perf_sync_us = tv->perf_vbl_us = tv->perf_flush_us = 0;
                     fclose(pf);

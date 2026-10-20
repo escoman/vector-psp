@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "options.h"
-#include "sound_filters.h"
+#include "sound_engine.h"
 #include "util.h"
 #include "debuglog.h"
 
@@ -112,12 +112,12 @@ static void apply_line(const std::string & line)
         Options.sound_record = b;
     } else if (key == "sound_buffer_ms" && parse_buffer_ms(val, ms)) {
         Options.sound_buffer_ms = ms;
-    } else if (key == "sound_mode") {
-        SoundMode m;
-        if (sound_filters::parse_mode(val, SoundMode::None, m)) {
-            Options.sound_mode = m;
+    } else if (key == "sound_engine") {
+        SoundEngine e;
+        if (engine_from_name(val, SoundEngine::New, e)) {
+            Options.sound_engine = e;
         } else {
-            dbglog("Unknown sound_mode: %s, using none\n", val.c_str());
+            dbglog("Unknown sound_engine: %s, using optimized\n", val.c_str());
         }
     } else if (key == "worker_priority" && parse_priority(val, prio)) {
         Options.worker_priority = prio;
@@ -174,11 +174,15 @@ static void create_default(const std::string & path)
         "# dropouts; higher = safer playback, more latency.\n"
         "sound_buffer_ms = 40\n"
         "\n"
-        "# Waveform reconstruction of the audio playback (resampler\n"
-        "# kernel): none = reference linear two-point (default),\n"
-        "# cubic = Catmull-Rom, gaussian = 4-tap Gaussian table,\n"
-        "# sinc = 8-tap Hann-windowed sinc table.\n"
-        "sound_mode = none\n"
+        "# Which sound pipeline runs (see src/sound_engine.h):\n"
+        "# off = no audio generation at all (use it to measure how much\n"
+        "#       the sound subsystem costs the CPU),\n"
+        "# original = the reference kernel's path: the 8253 is stepped\n"
+        "#       and sampled once per sound clock, AY is box-averaged,\n"
+        "# optimized = the block path: queued chip writes replayed per\n"
+        "#       frame with the timer integrated as a duty cycle\n"
+        "# (legacy names old / new are still accepted)\n"
+        "sound_engine = optimized\n"
         "\n"
         "# Thread priorities, hex, lower = higher priority (0x08..0x77).\n"
         "# worker = emulation, main = display. When a heavy game drives\n"
@@ -205,7 +209,7 @@ std::string config_load(const char * argv0)
     Options.fast_framebuffer = true;
     Options.sound_record = false;
     Options.sound_buffer_ms = 40;
-    Options.sound_mode = SoundMode::None;
+    Options.sound_engine = SoundEngine::New;
     Options.worker_priority = 0x20;
     Options.main_priority = 0x18;
     Options.catalog_url = "http://roms2.sarmin.ru/catalog.php?platform=Vector-06C";
@@ -220,10 +224,10 @@ std::string config_load(const char * argv0)
         parse(data);
     }
 
-    dbglog("config: %s border=%d fps=%d fastfb=%d sndrec=%d sndbuf=%dms sndmode=%s wrk_prio=0x%02x main_prio=0x%02x\n",
+    dbglog("config: %s border=%d fps=%d fastfb=%d sndrec=%d sndbuf=%dms engine=%s wrk_prio=0x%02x main_prio=0x%02x\n",
            path.c_str(), (int)Options.show_border, (int)Options.show_fps,
            (int)Options.fast_framebuffer, (int)Options.sound_record,
-           Options.sound_buffer_ms, sound_filters::mode_name(Options.sound_mode),
+           Options.sound_buffer_ms, engine_name(Options.sound_engine),
            Options.worker_priority, Options.main_priority);
     return path;
 }

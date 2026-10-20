@@ -242,6 +242,28 @@ int Board::execute_frame_with_cadence(bool update_screen, bool use_cadence)
     return (c || !use_cadence) && execute_frame(update_screen);
 }
 
+/* Perf instrumentation (test builds only). Splitting the single step
+ * into "cpu" and "fill" cannot be timed per call: the PSP clock
+ * resolves 1 us while a step costs a fraction of that, so every
+ * reading rounds up and the extrapolated sum overshoots the exact
+ * exec by ~1.8x. Instead we time a block of PERF_STEP_BLOCK calls and
+ * let the per-call deltas decide only the ratio; the magnitude comes
+ * from the span measured across the whole period, so cpu + fill is
+ * bounded by exec by construction. Trustworthy only as a ratio - for
+ * absolute attribution use a PROFILE=1 build and psp-gprof. */
+namespace {
+    const unsigned PERF_STEP_PERIOD = 1024;  /* calls between timed blocks */
+    const unsigned PERF_STEP_BLOCK = 64;     /* calls inside a timed block */
+    struct PerfStep {
+        unsigned cnt = 0;      /* calls seen since the last block start */
+        unsigned left = 0;     /* timed calls remaining in this block */
+        unsigned t_span = 0;   /* clock at the start of the timed block */
+        unsigned ta = 0, tb = 0;
+        unsigned cpu_raw = 0;  /* summed cpu deltas of this block */
+        unsigned fill_raw = 0; /* summed fill deltas of this block */
+    } perf_step;
+}
+
 void Board::single_step(bool update_screen)
 {
     /* Debug: log PC and next 3 instruction bytes to debug.log */
@@ -265,16 +287,22 @@ void Board::single_step(bool update_screen)
     }
 
 #ifdef AUTOSELECT_ROM
-    static unsigned perf_step_cnt = 0;
-    const bool perf_sample = ((perf_step_cnt++ & 31) == 0);
-    unsigned perf_ta = 0, perf_tb = 0;
-    if (perf_sample) perf_ta = sceKernelGetSystemTimeLow();
+    /* Timed calls: the first of each block anchors the span, the last
+     * one closes it and distributes the span over cpu/fill. */
+    const bool perf_sample = perf_step.left > 0
+        || (++perf_step.cnt % PERF_STEP_PERIOD == 0);
+    if (perf_sample && perf_step.left == 0) {
+        perf_step.left = PERF_STEP_BLOCK;
+        perf_step.t_span = sceKernelGetSystemTimeLow();
+        perf_step.cpu_raw = perf_step.fill_raw = 0;
+    }
+    if (perf_sample) perf_step.ta = sceKernelGetSystemTimeLow();
 #endif
     auto v_cycles = i8080_instruction(&this->last_opcode);
     total_v_cycles += v_cycles;
     this->instr_time += v_cycles;
 #ifdef AUTOSELECT_ROM
-    if (perf_sample) perf_tb = sceKernelGetSystemTimeLow();
+    if (perf_sample) perf_step.tb = sceKernelGetSystemTimeLow();
 #endif
 
     int commit_time = -1, commit_time_pal = -1;
@@ -290,8 +318,20 @@ void Board::single_step(bool update_screen)
 #ifdef AUTOSELECT_ROM
     if (perf_sample) {
         unsigned perf_tc = sceKernelGetSystemTimeLow();
-        this->perf_cpu_us += (perf_tb - perf_ta) << 5;
-        this->perf_fill_us += (perf_tc - perf_tb) << 5;
+        perf_step.cpu_raw += perf_step.tb - perf_step.ta;
+        perf_step.fill_raw += perf_tc - perf_step.tb;
+        if (--perf_step.left == 0) {
+            /* Block complete: scale the raw ratio onto the span the
+             * machine really spent between the first ta and the last tc. */
+            const unsigned span = perf_tc - perf_step.t_span;
+            const unsigned raw = perf_step.cpu_raw + perf_step.fill_raw;
+            if (raw > 0 && span > 0) {
+                this->perf_cpu_us +=
+                    (unsigned)((uint64_t)span * perf_step.cpu_raw / raw);
+                this->perf_fill_us +=
+                    (unsigned)((uint64_t)span * perf_step.fill_raw / raw);
+            }
+        }
     }
 #endif
 
@@ -349,8 +389,16 @@ void Board::single_step(bool update_screen)
      * the raw instruction T-states) keeps Exolon's IN 0x0A frame-sync wrap
      * at a fixed beam position; an accumulator on v_cycles decoupled the
      * two and shredded the picture. Sound is unaffected: it runs off
-     * Soundnik's separate timer_ch[] mirror. */
-    this->io.tick_timer(this->instr_time / 2);
+     * Soundnik's separate timer_ch[] mirror.
+     * Exception: the old (reference kernel) engine is the sole driver of
+     * the 8253 - Soundnik::process_frame_old() steps it once per sound
+     * clock at frame end, so the guest tick is skipped there to avoid a
+     * double advance. (Tradeoff: IN 0x08..0x0B countdown is only updated
+     * at the frame boundary under that engine; the block engine, the
+     * default, keeps the per-instruction live tick above.) */
+    if (Options.sound_engine != SoundEngine::Old) {
+        this->io.tick_timer(this->instr_time / 2);
+    }
     /* Event-based sound: only advance the sound clock here. Chip writes
      * are queued as events by IO and rendered in batch at frame end. */
     this->soundnik.advance_clock(this->instr_time / 2);

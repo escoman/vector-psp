@@ -3,10 +3,15 @@
 # run_60sec_kill - timed PPSSPP run for the Vector-06C emulator.
 #
 # Starts PPSSPP with the deployed VECTOR06C homebrew, lets it run for
-# 65 seconds and then kills the PPSSPP process. The 5 extra seconds
-# are for the emulator itself: the AUTOSELECT test build stops after
-# 60 s and needs a moment to flush its logs (perf.log, gmon.out)
-# into the game directory before PPSSPP is torn down.
+# RUN_SECONDS (default 65) and then kills the PPSSPP process. The 5
+# seconds on top of the emulator's own 60 s limit are for flushing its
+# logs (perf.log, gmon.out) into the game directory before PPSSPP is
+# torn down.
+#
+# PROFILE builds need more than the default: PPSSPP itself takes ~10 s
+# to reach the emulated frame loop, so the 60 s auto-stop lands late
+# and a 65 s wait kills the process before gmon.out is written. Use
+#   RUN_SECONDS=100 utils/run_60sec_kill
 #
 # Usage: psp/utils/run_60sec_kill [ppsspp-log]
 #   ppsspp-log defaults to <game dir>/ppsspp.log
@@ -21,6 +26,7 @@ GD="$HOME/snap/ppsspp-emu/common/.config/ppsspp/PSP/GAME/VECTOR06C"
 EBOOT="$GD/EBOOT.PBP"
 PPSSPP="/snap/bin/ppsspp-emu.ppsspp-sdl"
 RUN_LOG="${1:-$GD/ppsspp.log}"
+RUN_SECONDS="${RUN_SECONDS:-65}"
 
 if [ ! -f "$EBOOT" ]; then
     echo "run_60sec_kill: $EBOOT not found - deploy an EBOOT first" >&2
@@ -38,13 +44,26 @@ cd "$GD" || exit 1
 DISPLAY=:0 setsid "$PPSSPP" "$EBOOT" > "$RUN_LOG" 2>&1 &
 PGID=$!
 
-echo "run_60sec_kill: waiting 65 s..."
-sleep 65
+echo "run_60sec_kill: waiting $RUN_SECONDS s..."
+sleep "$RUN_SECONDS"
 
 echo "run_60sec_kill: killing PPSSPP (pgid $PGID)"
 kill -TERM -- "-$PGID" 2>/dev/null
 sleep 2
 kill -KILL -- "-$PGID" 2>/dev/null
+
+# The AUTOSELECT build only writes its final reports (gmon.out for
+# PROFILE builds, the last stats block) once it reaches the 60 s limit.
+# Fewer than 58 one-second windows means the kill came too early and the
+# run is not a valid 60 s measurement.
+if [ ! -f "$GD/gmon.out" ] && [ -f "$GD/perf.log" ]; then
+    windows=$(grep -c '^PERF' "$GD/perf.log" 2>/dev/null || echo 0)
+    if [ "$windows" -lt 58 ]; then
+        echo "run_60sec_kill: only $windows one-second windows collected -" \
+             "the run never reached the 60 s auto-stop." >&2
+        echo "run_60sec_kill: rerun with RUN_SECONDS=$((RUN_SECONDS + 35))" >&2
+    fi
+fi
 
 echo "run_60sec_kill: done; results in $GD:"
 ls -l "$GD/perf.log" "$GD/gmon.out" 2>/dev/null || true

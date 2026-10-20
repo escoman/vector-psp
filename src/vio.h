@@ -11,6 +11,7 @@
 
 #include "serialize.h"
 #include "sound_events.h"
+#include "options.h"
 
 class IO {
 private:
@@ -287,7 +288,11 @@ public:
 
     void sound_emit(SoundEventType type, uint8_t addr, uint8_t value)
     {
-        if (this->sound_event) {
+        /* No sound engine: skip the queue write entirely. The Off
+         * measurement must not pay for event recording/clearing, which
+         * is part of the block pipeline only. */
+        if (this->sound_event
+                && Options.sound_engine != SoundEngine::Off) {
             this->sound_event(type, addr, value);
         }
     }

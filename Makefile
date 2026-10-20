@@ -1,14 +1,14 @@
 # PSP build for vector06sdl - Vector-06C emulator
 # Builds EBOOT.PBP, copies result into release/VECTOR06C/ (ready game package)
 
-VERSION = 1.0.3
-VERSION_INFO = "fix timer"
+VERSION = 1.0.4
+VERSION_INFO = "sound engine switch"
 
 TARGET = v06xpsp
 OBJS = src/main.o src/debuglog.o src/config.o src/filelist.o src/imgload.o \
 	src/stb_impl.o src/netman.o \
 	src/i8080.o src/memory.o src/board.o src/filler.o \
-	src/emulator.o src/options.o src/tv.o src/sound.o src/sound_filters.o \
+	src/emulator.o src/options.o src/tv.o src/sound.o src/sound_engine.o \
 	src/debug.o src/fsimage.o src/cadence.o \
 	src/util.o src/utils_string.o src/hal.o src/statefile.o \
 	src/keymap.o \

@@ -12,6 +12,11 @@ release/VECTOR06C/BOOT.PBP
 release/*.zip
 assets/logo_data.c
 
-# Sound-mode test artifacts
+# Sound-engine test artifacts
+engine_results/
 sound_mode_results/
+
+# Timing-measurement scratch
+perf-measure/
+
 __pycache__/

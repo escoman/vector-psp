@@ -5,7 +5,7 @@
 #include "globaldefs.h"
 #include "8253.h"
 #include "ay.h"
-#include "sound_filters.h"
+#include "sound_engine.h"
 #include "wav.h"
 #include "sound_events.h"
 
@@ -44,11 +44,8 @@ private:
     static const uint32_t STEP_RANGE = STEP_MAX - STEP_MIN;
     static const uint32_t TARGET_FILL = 1764; /* 40 ms of sound, default */
     uint32_t target_fill; /* runtime value, from sound_buffer_ms */
-    /* Waveform reconstruction kernel of the callback resampler
-     * (config.ini: sound_mode). Selected once in init(), before the
-     * audio callback is registered; the hot loop only sees the enum.
-     * None = the historical linear two-point reconstruction. */
-    SoundMode sound_mode;
+    /* Playback reconstruction is fixed to the two-point linear one;
+     * the quality question lives inside the engines themselves. */
     uint64_t rd_frame;   /* next ring frame to read (resampled pos) */
     uint32_t rd_frac;    /* fractional phase of the resampler */
     uint32_t step_frac;  /* playback step per output frame */
@@ -125,6 +122,11 @@ private:
     AY mirror_ay;
     int ay_accu;
     float ay_last;
+    /* Armed by the first AY register write. Games that make music only
+     * through the VI53 timers or the beeper never touch the AY, and
+     * synthesizing a silent chip + running the decimator FIR over it is
+     * pure waste, so step_ay short-circuits until this turns true. */
+    bool ay_active;
 
     /* Anti-alias decimation FIR for the AY channel. The chip is stepped
      * at 218750 Hz while output samples are produced at 44100 Hz, so
@@ -135,7 +137,7 @@ private:
      * into the audible band (the "hissing" tone channels). The length
      * must match AY_DECIM_TAPS in ay_decim_coef.h (checked by a
      * static_assert in step_ay). */
-    static const int AY_HIST_LEN = 128;   /* power of two: index masking */
+    static const int AY_HIST_LEN = 64;    /* power of two: index masking */
     float ay_hist[AY_HIST_LEN];
     int ay_hist_pos;                      /* index of the oldest sample */
 
@@ -159,6 +161,19 @@ private:
     };
     TimerChannel timer_ch[3];
 
+    /* --- old (reference kernel) engine ---
+     * It generates the stream the kernel's way: once per sound clock
+     * the 8253 OUT pins are stepped and sampled as a 1-clock snapshot,
+     * the AY is stepped at ~218 kHz and box-averaged over the output
+     * period, and the mixed stream is decimated. State lives here; the
+     * engine reads the real chips (timerwrapper / aywrapper) instead of
+     * the mirrors, and is the sole driver of the 8253 while selected
+     * (see Board::single_step). */
+    uint64_t old_clock;   /* last sound clock consumed by the engine */
+    float old_box_sum;    /* running sum of per-clock soundf */
+    int old_box_n;        /* clocks accumulated into old_box_sum */
+    int old_box_dt;       /* clocks that close the current output sample */
+
     int tapeout_level;
     int tapein_level;
     int covox_level;
@@ -171,11 +186,16 @@ private:
     int next_sample_dt();
     void reset_mirrors();
 
+    /* Reference kernel pipeline (sound_engine = old): one output sample
+     * per ~34 sound clocks, mixed exactly like the kernel's soundSteps
+     * and decimated by a box average of the per-clock stream. */
+    void process_frame_old();
+
 public:
     Soundnik(TimerWrapper & tw, AYWrapper & aw) : timerwrapper(tw),
         aywrapper(aw), wr_total(0), wr_buf_idx(0), wr_pos(0),
         target_fill(TARGET_FILL),
-        sound_mode(SoundMode::None),
+        old_clock(0), old_box_sum(0.0f), old_box_n(0), old_box_dt(0),
         rd_frame(0), rd_frac(0), step_frac(STEP_ONE), rate_int(0),
         rdbuf(0), rdpos(0),
         last_value(0.0f), underrun_frames(0),
@@ -199,7 +219,7 @@ public:
         inv_dt_lo(1.0f / (SOUND_CLOCK_RATE / 44100)),
         inv_dt_hi(1.0f / (SOUND_CLOCK_RATE / 44100 + 1)),
         covox_norm(0.0f),
-        ay_accu(0), ay_last(0),
+        ay_accu(0), ay_last(0), ay_active(false),
         tapeout_level(1), tapein_level(0), covox_level(0xff)
     {
         for (int i = 0; i < NBUFFERS; ++i) {
@@ -217,20 +237,18 @@ public:
     /* Queue a chip write at the current sound clock (called from IO). */
     void push_event(SoundEventType type, uint8_t addr, uint8_t value);
 
-    /* Runtime switch of the reconstruction kernel (Config window).
-     * Every kernel shares the same loop structure and the prebuilt
-     * coefficient tables, so no resampler object recreation is
-     * needed: the callback snapshots the enum once per invocation
-     * and picks the new mode on its next call. Worker thread. */
-    void set_sound_mode(SoundMode m)
-    {
-        this->sound_mode = m;
-    }
-
     /* Runtime update of the ring fill target (Config window:
      * sound_buffer_ms). Same clamp as init(); the PI controller
      * settles onto the new target by itself. Worker thread. */
     void set_buffer_ms(int ms);
+
+    /* Runtime sound_engine switch (Config window, worker thread). The
+     * block and old engines keep independent sample cursors, so both
+     * are re-aligned to the current sound_clock; the event queue is
+     * dropped (it would otherwise cross-render old clocks) and the
+     * audio output is (re)initialised when moving off -> on. Switching
+     * to off leaves the callback holding silence. */
+    void apply_engine();
 
     /* Advance the sound clock (replacement for the old soundSteps).
      * Called per instruction from Board::single_step(), so it must be
@@ -250,6 +268,7 @@ public:
 #ifdef AUTOSELECT_ROM
     /* process_frame sub-stage breakdown (test builds only) */
     unsigned perf_ev_us = 0, perf_tmr_us = 0, perf_ay_us = 0, perf_mix_us = 0;
+    unsigned perf_ay_chip_us = 0, perf_ay_fir_us = 0;
     unsigned perf_nsamples = 0, perf_naysteps = 0;
 #endif
 
